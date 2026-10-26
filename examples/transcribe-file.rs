@@ -39,6 +39,7 @@ fn main() {
         WHISPER_SAMPLE_RATE
     );
 
+    let load_started = std::time::Instant::now();
     let context =
         match WhisperContext::new_with_params(model_path, WhisperContextParameters::default()) {
             Ok(context) => context,
@@ -47,7 +48,24 @@ fn main() {
                 std::process::exit(1);
             }
         };
-    println!("loaded {model_path}");
+    let load_time = load_started.elapsed();
+
+    // Timed separately because creating a state allocates the KV cache and
+    // compute buffers. The live path builds one and reuses it; doing it per
+    // phrase would add this much to every single inference.
+    let state_started = std::time::Instant::now();
+    let mut state = match context.create_state() {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("could not create a recogniser state: {err}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "loaded {model_path} in {:.2}s (recogniser state: {:.2}s)",
+        load_time.as_secs_f32(),
+        state_started.elapsed().as_secs_f32()
+    );
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(8) as i32)
@@ -102,7 +120,7 @@ fn main() {
     let mut transcript = String::new();
     for (i, phrase) in phrases.iter().enumerate() {
         let started = std::time::Instant::now();
-        match transcribe_clip(&context, phrase, false, threads) {
+        match transcribe_clip(&mut state, phrase, false, threads) {
             Ok(text) => {
                 println!(
                     "phrase {} ({:.1}s audio, {:.1}s to transcribe): {text}",

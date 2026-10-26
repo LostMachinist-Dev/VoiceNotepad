@@ -128,6 +128,8 @@ pub struct VoiceNotepad {
     devices: Vec<String>,
     draft: Config,
 
+    /// Why the hotkeys may not reach us here, if the platform can tell.
+    hotkey_caveat: Option<crate::platform::HotkeyCaveat>,
     message: Option<(String, Instant)>,
     /// The title last sent to the window manager, so it is only sent again
     /// when it has actually changed.
@@ -138,7 +140,7 @@ pub struct VoiceNotepad {
 }
 
 impl VoiceNotepad {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
         let config = Config::load();
         let appearance = theme::resolve(config.theme);
         theme::apply(&cc.egui_ctx, appearance);
@@ -150,11 +152,17 @@ impl VoiceNotepad {
 
         let mut hotkeys = Hotkeys::new();
         hotkeys.apply(&config.toggle_spec(), &config.bullet_spec());
-        let hotkey_warning = hotkeys.warning.clone();
+        // Either the registration failed, or it succeeded somewhere the keys
+        // will never arrive from. Both are worth saying out loud.
+        let hotkey_caveat = crate::platform::hotkey_caveat();
+        let hotkey_warning = hotkeys
+            .warning
+            .clone()
+            .or_else(|| hotkey_caveat.as_ref().map(|c| c.short.clone()));
 
         let devices = crate::audio::list_input_devices();
 
-        VoiceNotepad {
+        let mut app = VoiceNotepad {
             draft: config.clone(),
             hotkey_draft: (config.toggle_hotkey.clone(), config.bullet_hotkey.clone()),
             config,
@@ -185,12 +193,18 @@ impl VoiceNotepad {
             find_message: None,
             capture_hotkey: None,
             devices,
+            hotkey_caveat,
             message: hotkey_warning.clone().map(|w| (w, Instant::now())),
             last_title: String::new(),
             error: None,
             confirm: None,
             closing: false,
+        };
+
+        if let Some(path) = open {
+            app.load_path(&path);
         }
+        app
     }
 
     // --- document helpers -------------------------------------------------
@@ -280,8 +294,13 @@ impl VoiceNotepad {
             .add_filter("All files", &["*"])
             .pick_file();
         let Some(path) = picked else { return };
+        self.load_path(&path);
+    }
 
-        match std::fs::read(&path) {
+    /// Read a file into the document. Used by File > Open and by a path given
+    /// on the command line.
+    pub fn load_path(&mut self, path: &std::path::Path) {
+        match std::fs::read(path) {
             Ok(bytes) => {
                 let raw = String::from_utf8_lossy(&bytes).to_string();
                 self.line_ending = LineEnding::detect(&raw);
@@ -298,7 +317,7 @@ impl VoiceNotepad {
                 } else {
                     normalised
                 };
-                self.path = Some(path);
+                self.path = Some(path.to_path_buf());
                 self.dirty = false;
                 self.undo.clear();
                 self.redo.clear();
@@ -1348,6 +1367,13 @@ impl VoiceNotepad {
                 self.hotkey_row(ui, HotkeyField::Bullet, "New bullet");
                 if !self.hotkeys.available() {
                     ui.small("System-wide hotkeys are unavailable in this session.");
+                }
+                if let Some(caveat) = &self.hotkey_caveat {
+                    ui.add_space(2.0);
+                    ui.small(
+                        egui::RichText::new(caveat.detail.clone())
+                            .color(theme::palette(self.appearance).recording),
+                    );
                 }
 
                 ui.add_space(12.0);

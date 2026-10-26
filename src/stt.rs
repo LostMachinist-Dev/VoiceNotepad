@@ -17,7 +17,9 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 use crate::audio::{self, AudioError, SharedAudio};
 use crate::config::{find_model, model_dir, ModelSize};
@@ -41,6 +43,35 @@ const MAX_PHRASE_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * 15;
 /// Audio kept before the voice detector fires, so phrase onsets are not
 /// clipped. 10 frames is 200 ms.
 const PREROLL_FRAMES: usize = 10;
+
+/// Whisper's encoder window, in frames: 30 seconds at 50 frames per second.
+const FULL_AUDIO_CTX: usize = 1500;
+
+/// Never give the encoder less context than this, however short the phrase.
+///
+/// Measured on whisper.cpp's jfk.wav with small.en, per phrase: the full 1500
+/// takes 2.0 s, 256 takes 0.3 s but starts repeating itself ("Ask not. Ask
+/// not."), 512 takes 0.5 s and matches the full-context text exactly, and 768
+/// takes 0.9 s for no further gain. Whisper's position embeddings are trained
+/// on the full window, so cutting too close to the audio degrades it.
+const MIN_AUDIO_CTX: usize = 512;
+
+/// How much encoder context a clip of this length actually needs.
+///
+/// Whisper pads every clip to 30 seconds and, left alone, encodes all of it --
+/// so a three second phrase spends most of its time encoding silence. Telling
+/// it how much of the window is real is the single biggest speed win
+/// available here, and it costs nothing in accuracy as long as the figure
+/// covers the audio with room to spare.
+///
+/// Samples map to encoder frames at 320 samples each (160-sample hop, halved
+/// again by the convolution stride).
+fn audio_ctx_for(samples: usize) -> std::ffi::c_int {
+    let frames = samples / 320;
+    // Margin for the mel padding and the tail of the final window.
+    let rounded = (frames + 96).div_ceil(64) * 64;
+    rounded.clamp(MIN_AUDIO_CTX, FULL_AUDIO_CTX) as std::ffi::c_int
+}
 
 /// What the UI asks of the engine.
 #[derive(Debug, Clone)]
@@ -141,6 +172,11 @@ struct Worker {
     device: Option<String>,
 
     context: Option<WhisperContext>,
+    /// Reused across inferences. Creating one allocates close to 200 MB of
+    /// KV cache and compute buffers, so doing it per phrase -- which is what
+    /// this used to do -- cost more than the inference itself on a slower
+    /// machine.
+    state: Option<WhisperState>,
     /// Set when the model on disk no longer matches `model_size`.
     context_stale: bool,
 
@@ -172,6 +208,7 @@ impl Worker {
             model_size,
             device,
             context: None,
+            state: None,
             context_stale: false,
             audio_queue: audio::shared_audio(),
             capture: None,
@@ -236,6 +273,7 @@ impl Worker {
                 if size != self.model_size {
                     self.model_size = size;
                     self.context = None;
+                    self.state = None;
                     self.context_stale = true;
                     self.ensure_model_file();
                 }
@@ -283,7 +321,7 @@ impl Worker {
     /// Load the model into memory. Slow (a second or two), so it happens here
     /// on the engine thread rather than on the UI thread.
     fn ensure_context(&mut self) -> bool {
-        if self.context.is_some() && !self.context_stale {
+        if self.context.is_some() && self.state.is_some() && !self.context_stale {
             return true;
         }
         let Some(path) = find_model(self.model_size) else {
@@ -297,10 +335,23 @@ impl Worker {
         let params = WhisperContextParameters::default();
         match WhisperContext::new_with_params(&path, params) {
             Ok(context) => {
-                self.context = Some(context);
-                self.context_stale = false;
-                self.emit(Event::ModelReady);
-                true
+                // Build the state once, here, where the wait is already
+                // expected rather than in the middle of a phrase.
+                match context.create_state() {
+                    Ok(state) => {
+                        self.state = Some(state);
+                        self.context = Some(context);
+                        self.context_stale = false;
+                        self.emit(Event::ModelReady);
+                        true
+                    }
+                    Err(err) => {
+                        self.emit(Event::Error(format!(
+                            "The speech recogniser could not be started: {err}"
+                        )));
+                        false
+                    }
+                }
             }
             Err(err) => {
                 self.emit(Event::Error(format!(
@@ -436,11 +487,16 @@ impl Worker {
             && self.phrase.len() >= MIN_PHRASE_SAMPLES
             && self.last_partial.elapsed() >= PARTIAL_INTERVAL
         {
-            self.last_partial = Instant::now();
             if let Some(text) = self.transcribe(true) {
                 self.partial_sent = true;
                 self.emit(Event::Partial(text));
             }
+            // Timed from when the pass *finished*, not when it started. On a
+            // slow machine an inference can outlast the interval, and timing
+            // from the start would leave no gap at all: partials would run
+            // back to back, the audio queue would not be drained, and the
+            // window would feel stuck.
+            self.last_partial = Instant::now();
         }
     }
 
@@ -466,8 +522,15 @@ impl Worker {
     /// `partial` asks for one segment and a cheaper search, because the result
     /// is about to be replaced anyway.
     fn transcribe(&mut self, partial: bool) -> Option<String> {
-        let context = self.context.as_ref()?;
-        match transcribe_clip(context, &self.phrase, partial, self.threads) {
+        let threads = self.threads;
+        let phrase = std::mem::take(&mut self.phrase);
+        let result = match self.state.as_mut() {
+            Some(state) => transcribe_clip(state, &phrase, partial, threads),
+            None => Err("The speech recogniser is not loaded.".to_string()),
+        };
+        self.phrase = phrase;
+
+        match result {
             Ok(text) => Some(text),
             Err(message) => {
                 self.emit(Event::Error(message));
@@ -488,15 +551,11 @@ impl Worker {
 /// the previous text back as context measured no better on the test clip and
 /// leaks a `CString` per call in whisper-rs 0.16.
 pub fn transcribe_clip(
-    context: &WhisperContext,
+    state: &mut WhisperState,
     samples: &[f32],
     partial: bool,
     threads: i32,
 ) -> Result<String, String> {
-    let mut state = context
-        .create_state()
-        .map_err(|err| format!("The speech recogniser could not be started: {err}"))?;
-
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(threads);
     params.set_language(Some("en"));
@@ -517,7 +576,11 @@ pub fn transcribe_clip(
         params.set_temperature_inc(0.0);
     }
 
+    // See audio_ctx_for: do not make the encoder chew through the silence
+    // Whisper pads every clip with.
     let audio = pad_for_inference(samples);
+    params.set_audio_ctx(audio_ctx_for(audio.len()));
+
     state
         .full(params, &audio)
         .map_err(|err| format!("Transcription failed: {err}"))?;
@@ -534,4 +597,60 @@ pub fn transcribe_clip(
     }
 
     Ok(clean_transcript(&text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resample::WHISPER_SAMPLE_RATE;
+
+    fn seconds(s: f32) -> usize {
+        (WHISPER_SAMPLE_RATE as f32 * s) as usize
+    }
+
+    #[test]
+    fn short_phrases_get_the_minimum_encoder_context() {
+        // Below the floor the model starts repeating itself; see MIN_AUDIO_CTX.
+        assert_eq!(audio_ctx_for(seconds(1.0)), MIN_AUDIO_CTX as i32);
+        assert_eq!(audio_ctx_for(seconds(3.0)), MIN_AUDIO_CTX as i32);
+        assert_eq!(audio_ctx_for(0), MIN_AUDIO_CTX as i32);
+    }
+
+    #[test]
+    fn long_phrases_get_more_context_in_proportion() {
+        let ten = audio_ctx_for(seconds(10.0));
+        let twenty = audio_ctx_for(seconds(20.0));
+        assert!(ten > MIN_AUDIO_CTX as i32, "10s should need more than the floor");
+        assert!(twenty > ten, "20s should need more context than 10s");
+    }
+
+    #[test]
+    fn encoder_context_never_exceeds_the_models_window() {
+        // Whisper asserts on anything above its trained window.
+        assert_eq!(audio_ctx_for(seconds(30.0)), FULL_AUDIO_CTX as i32);
+        assert_eq!(audio_ctx_for(seconds(120.0)), FULL_AUDIO_CTX as i32);
+    }
+
+    #[test]
+    fn context_always_covers_the_audio_with_room_to_spare() {
+        // The whole point: too small and the tail of the phrase is cut off.
+        for secs in [1.0f32, 2.5, 5.0, 8.0, 12.0, 15.0, 25.0] {
+            let samples = seconds(secs);
+            let needed = (samples / 320) as i32;
+            let given = audio_ctx_for(samples);
+            assert!(
+                given >= needed + 64,
+                "{secs}s needs {needed} frames but was given only {given}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_phrase_at_the_hard_commit_limit_still_fits() {
+        // MAX_PHRASE_SAMPLES is the longest clip the live path can produce.
+        let given = audio_ctx_for(MAX_PHRASE_SAMPLES);
+        let needed = (MAX_PHRASE_SAMPLES / 320) as i32;
+        assert!(given >= needed + 64);
+        assert!(given <= FULL_AUDIO_CTX as i32);
+    }
 }
