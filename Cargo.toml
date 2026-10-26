@@ -1,0 +1,76 @@
+[package]
+name = "voice-notepad"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A Windows Notepad look-alike with local, offline speech-to-text"
+authors = ["yerko42@gmail.com"]
+license = "MIT"
+
+[lib]
+name = "voice_notepad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "VoiceNotepad"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+# Everything the shipping binary needs. On by default; turning it off leaves
+# the pure text/config/download logic, which is what `cargo test
+# --no-default-features` exercises without needing ALSA or a GPU present.
+default = ["app"]
+app = [
+    "dep:arboard",
+    "dep:cpal",
+    "dep:eframe",
+    "dep:egui",
+    "dep:global-hotkey",
+    "dep:rfd",
+    "dep:whisper-rs",
+]
+
+[dependencies]
+# --- always built -------------------------------------------------------
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Model download only. rustls + ring + webpki-roots keeps the exe self-contained.
+ureq = "3"
+
+# --- the GUI/audio half, behind the `app` feature ----------------------
+# glow (OpenGL) rather than the default wgpu backend: smaller binary, faster
+# cold start, and it runs under Wine for smoke-testing.
+eframe = { version = "0.37", default-features = false, optional = true, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+egui = { version = "0.37", optional = true }
+# Speech to text: whisper.cpp. CPU build - see HANDOFF.md for why.
+whisper-rs = { version = "0.16", default-features = false, optional = true }
+cpal = { version = "0.18", optional = true }
+arboard = { version = "3.7", optional = true }
+rfd = { version = "0.17", optional = true }
+global-hotkey = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[patch.crates-io]
+# Patched for *-windows-gnu cross-compilation; run scripts/vendor-whisper-sys.py
+# to create it. See HANDOFF.md -> "The whisper-rs-sys patch".
+whisper-rs-sys = { path = "third_party/whisper-rs-sys-0.15.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
