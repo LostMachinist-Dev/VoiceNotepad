@@ -4,6 +4,10 @@ A single-window text editor that looks and behaves like Windows Notepad, with
 local speech-to-text behind one mic button. You narrate while you work, and
 your words appear in the document as you speak, at the cursor.
 
+The recogniser is NVIDIA Parakeet, a *streaming* model: audio goes in a chunk
+at a time and text comes back as it is recognised, continuously, so dictation
+reads as flowing prose rather than disconnected phrases.
+
 Nothing leaves the machine. The speech model is downloaded once on first run
 and everything after that is offline.
 
@@ -11,13 +15,18 @@ and everything after that is offline.
 
 ## Installing on Windows
 
-Run `VoiceNotepad-1.1.0-Setup.exe` and click through it. It installs for your
+Run `VoiceNotepad-2.0.0-Setup.exe` and click through it. It installs for your
 user only, so Windows will not ask for an administrator password. When it
 finishes, Voice Notepad is in the Start menu.
 
-The first time you open it, it downloads the speech model (about 466 MB for
-the default `small.en`) and shows a progress bar. You can type while it
-downloads. After that it never uses the network again.
+The first time you open it, it downloads the speech model and shows a
+progress bar. The recommended model is 2.4 GB, so give it a few minutes; you
+can type while it downloads, and there is a much smaller one in Settings if
+you would rather. After that it never uses the network again.
+
+There is also `VoiceNotepad-2.0.0-portable.zip` if you would rather not
+install anything: unzip it and run the exe. Keep `onnxruntime.dll` in the same
+folder - the program will not start without it.
 
 ## Installing on Linux
 
@@ -94,12 +103,19 @@ Testing the login screen.
     - no error message shown
 ```
 
-### Speed
+### Speed and the two models
 
-Transcription happens on the CPU. Roughly, on a reasonably modern desktop,
-`small.en` takes about half a second per spoken phrase, and `tiny.en` about a
-tenth. If it feels slow, drop to a smaller model in Settings before anything
-else - that is the single biggest lever.
+Transcription runs on the CPU, a chunk of audio at a time. What matters is
+whether a chunk is recognised faster than it takes to say, and on a modern
+desktop the recommended model manages it about four times over.
+
+| Model | Size | Notes |
+| --- | --- | --- |
+| Nemotron streaming (English) | 2.4 GB | The default. Punctuation and capitals. |
+| Realtime EOU | 483 MB | Far smaller and faster, but writes **no punctuation and no capital letters** - just lowercase words. |
+
+Switch in Settings. If dictation lags behind your speech on a slower machine,
+that is the lever to pull.
 
 ### Settings
 
@@ -130,6 +146,18 @@ The build runs on Linux and cross-compiles to Windows. See
 ./scripts/build-windows.sh        # just the exe
 cargo test --no-default-features  # the logic tests, no audio hardware needed
 ```
+
+## Sharing it with other people
+
+Send them `VoiceNotepad-2.0.0-Setup.exe` and nothing else. It is a single
+file - the support DLL is packed inside it and only appears on their disk when
+they install.
+
+Expect Windows to warn about it. An unsigned program from an unknown publisher
+gets a blue "Windows protected your PC" screen; the way past it is **More
+info** then **Run anyway**, which is worth telling people in advance. The only
+real fix is a code-signing certificate - see HANDOFF.md, and
+`scripts/sign-windows.sh`, which signs the build once a certificate exists.
 
 ## Licence
 

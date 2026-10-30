@@ -2,7 +2,8 @@
 # Build VoiceNotepad.exe and wrap it in a Windows installer.
 #
 # NSIS is not packaged for this box and there is no root access, so the
-# official Windows build of makensis is fetched once and run under Wine. That
+# official Windows build of makensis is fetched once and run under Wine. The
+# ONNX Runtime DLL the app needs at runtime is fetched the same way. That
 # is also exactly how it would run on a Windows machine, so the installer is
 # byte-for-byte what NSIS would produce there.
 set -euo pipefail
@@ -32,10 +33,18 @@ if [[ ! -f "$MAKENSIS" ]]; then
 fi
 [[ -f "$MAKENSIS" ]] || { echo "error: $MAKENSIS missing after fetch"; exit 1; }
 
+# ---- ONNX Runtime DLL ----------------------------------------------------
+ONNX_DLL="$("$ROOT/scripts/fetch-onnxruntime.sh")"
+[[ -f "$ONNX_DLL" ]] || { echo "error: onnxruntime.dll was not fetched"; exit 1; }
+
 # ---- build the exe -------------------------------------------------------
 "$ROOT/scripts/build-windows.sh" release
 EXE="$ROOT/target/x86_64-pc-windows-gnu/release/VoiceNotepad.exe"
 [[ -f "$EXE" ]] || { echo "error: $EXE was not built"; exit 1; }
+
+# Sign the program before it goes into the installer, so the copy that lands
+# on disk is signed too. A no-op when no certificate is configured.
+"$ROOT/scripts/sign-windows.sh" "$EXE"
 
 # ---- compile the installer ----------------------------------------------
 mkdir -p "$DIST"
@@ -51,10 +60,14 @@ touch "$OUT"   # so winepath can resolve it
 wine "$MAKENSIS" \
   "-DVERSION=$VERSION" \
   "-DSOURCE_EXE=$(win "$EXE")" \
+  "-DONNX_DLL=$(win "$ONNX_DLL")" \
   "-DASSETS=$(win "$ROOT/assets")" \
   "-DLICENSE_FILE=$(win "$ROOT/LICENSE")" \
   "-DOUTFILE=$(win "$OUT")" \
   "$(win "$ROOT/packaging/installer.nsi")"
+
+# And the installer itself, which is the file people actually double-click.
+"$ROOT/scripts/sign-windows.sh" "$OUT"
 
 echo
 echo "installer: $OUT"

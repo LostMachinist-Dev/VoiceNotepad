@@ -32,62 +32,86 @@ impl ThemePref {
     }
 }
 
-/// Whisper model size. These are the English-only models: faster and more
-/// accurate than the multilingual ones for dictation, which is all this does.
+/// Which speech model to use.
+///
+/// Both are streaming models: audio goes in a chunk at a time and text comes
+/// out as it is recognised, with the model keeping its own state between
+/// chunks. That is the whole reason for them -- the previous Whisper-based
+/// engine had to cut speech into phrases at silences and transcribe each one
+/// alone, which is what made the text come out in disconnected fragments.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum ModelSize {
-    Tiny,
-    Base,
+pub enum SpeechModel {
+    /// NVIDIA Nemotron streaming, English. Punctuates and capitalises.
     #[default]
-    Small,
-    Medium,
+    Nemotron,
+    /// Parakeet realtime EOU. A fifth of the size and much faster, but emits
+    /// no punctuation and no capital letters.
+    Eou,
 }
 
-impl ModelSize {
-    pub const ALL: [ModelSize; 4] = [
-        ModelSize::Tiny,
-        ModelSize::Base,
-        ModelSize::Small,
-        ModelSize::Medium,
-    ];
+impl SpeechModel {
+    pub const ALL: [SpeechModel; 2] = [SpeechModel::Nemotron, SpeechModel::Eou];
 
-    /// The ggml file name, which is also the name used on Hugging Face.
-    pub fn file_name(self) -> &'static str {
+    /// The folder this model lives in, under the models directory.
+    pub fn dir_name(self) -> &'static str {
         match self {
-            ModelSize::Tiny => "ggml-tiny.en.bin",
-            ModelSize::Base => "ggml-base.en.bin",
-            ModelSize::Small => "ggml-small.en.bin",
-            ModelSize::Medium => "ggml-medium.en.bin",
+            SpeechModel::Nemotron => "nemotron-streaming-en",
+            SpeechModel::Eou => "eou-120m",
+        }
+    }
+
+    /// The folder on Hugging Face it is fetched from.
+    pub fn remote_dir(self) -> &'static str {
+        match self {
+            SpeechModel::Nemotron => "nemotron-speech-streaming-en-0.6b",
+            SpeechModel::Eou => "realtime_eou_120m-v1-onnx",
+        }
+    }
+
+    /// Every file that must be present, smallest first so a failed download
+    /// wastes as little as possible.
+    pub fn files(self) -> &'static [&'static str] {
+        match self {
+            SpeechModel::Nemotron => &[
+                "config.json",
+                "tokenizer.model",
+                "encoder.onnx",
+                "decoder_joint.onnx",
+                "encoder.onnx.data",
+            ],
+            SpeechModel::Eou => &["tokenizer.json", "decoder_joint.onnx", "encoder.onnx"],
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            ModelSize::Tiny => "tiny.en",
-            ModelSize::Base => "base.en",
-            ModelSize::Small => "small.en",
-            ModelSize::Medium => "medium.en",
+            SpeechModel::Nemotron => "Nemotron streaming (English)",
+            SpeechModel::Eou => "Realtime EOU (small)",
         }
     }
 
     /// Rough download size, shown in Settings so the choice is informed.
     pub fn approx_size(self) -> &'static str {
         match self {
-            ModelSize::Tiny => "75 MB",
-            ModelSize::Base => "142 MB",
-            ModelSize::Small => "466 MB",
-            ModelSize::Medium => "1.5 GB",
+            SpeechModel::Nemotron => "2.4 GB",
+            SpeechModel::Eou => "483 MB",
         }
     }
 
-    /// A one-line hint about the speed/accuracy trade-off.
     pub fn hint(self) -> &'static str {
         match self {
-            ModelSize::Tiny => "fastest, least accurate",
-            ModelSize::Base => "fast",
-            ModelSize::Small => "recommended balance",
-            ModelSize::Medium => "most accurate, needs a strong CPU",
+            SpeechModel::Nemotron => "accurate, punctuated - recommended",
+            SpeechModel::Eou => "much faster, but no punctuation or capitals",
+        }
+    }
+
+    /// How much audio is handed to the model at a time. Informational; the
+    /// model itself is the authority once loaded.
+    pub fn chunk_ms(self) -> u32 {
+        match self {
+            SpeechModel::Nemotron => 560,
+            SpeechModel::Eou => 160,
         }
     }
 }
@@ -215,7 +239,7 @@ fn default_word_wrap() -> bool {
 #[serde(default)]
 pub struct Config {
     pub theme: ThemePref,
-    pub model: ModelSize,
+    pub model: SpeechModel,
     #[serde(default = "default_toggle_hotkey")]
     pub toggle_hotkey: String,
     #[serde(default = "default_bullet_hotkey")]
@@ -232,7 +256,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             theme: ThemePref::default(),
-            model: ModelSize::default(),
+            model: SpeechModel::default(),
             toggle_hotkey: default_toggle_hotkey(),
             bullet_hotkey: default_bullet_hotkey(),
             input_device: None,
@@ -296,36 +320,69 @@ pub fn config_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.json"))
 }
 
-/// Where downloaded Whisper models are kept.
+/// Where panics are recorded. Next to the settings, so "send me your
+/// settings folder" collects both.
+pub fn log_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("voice-notepad.log"))
+}
+
+/// Where downloaded speech models are kept.
 pub fn model_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "VoiceNotepad")
         .map(|d| d.data_dir().join("models"))
 }
 
-/// A model shipped next to the exe takes precedence over the download folder,
-/// so an installer can bundle one and the app will find it with no network.
+/// A model folder shipped next to the exe takes precedence over the download
+/// folder, so an installer can bundle one and it will be found with no
+/// network.
 pub fn bundled_model_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(exe.parent()?.join("models"))
 }
 
-/// Look for `size` next to the exe first, then in the download folder.
-pub fn find_model(size: ModelSize) -> Option<PathBuf> {
-    let name = size.file_name();
+/// Look for `model` next to the exe first, then in the download folder.
+///
+/// A model is a folder of several files now, not one file, so "present"
+/// means every file it needs is there and none of them is a stub.
+pub fn find_model(model: SpeechModel) -> Option<PathBuf> {
     for dir in [bundled_model_dir(), model_dir()].into_iter().flatten() {
-        let candidate = dir.join(name);
-        if is_plausible_model(&candidate) {
+        let candidate = dir.join(model.dir_name());
+        if model_is_complete(model, &candidate) {
             return Some(candidate);
         }
     }
     None
 }
 
-/// A ggml model is tens of megabytes at least; anything smaller is a truncated
-/// or failed download and should be treated as absent.
-pub fn is_plausible_model(path: &Path) -> bool {
+/// Is every file this model needs present and plausibly sized?
+///
+/// An interrupted download leaves a short file behind, which would otherwise
+/// fail later inside ONNX Runtime where the cause would not be obvious.
+///
+/// The size floor has to depend on the file: the weights are hundreds of
+/// megabytes, but `config.json` is under a kilobyte. A single flat threshold
+/// rejected a perfectly good model because its config file was 980 bytes.
+pub fn model_is_complete(model: SpeechModel, dir: &Path) -> bool {
+    model
+        .files()
+        .iter()
+        .all(|name| file_is_plausible(&dir.join(name), name))
+}
+
+/// Minimum believable size for one file of a model.
+fn minimum_size(name: &str) -> u64 {
+    if name.ends_with(".onnx") || name.ends_with(".data") {
+        // Weights. The smallest of these is tens of megabytes.
+        1024 * 1024
+    } else {
+        // Config and tokenizer files, which are small but never empty.
+        1
+    }
+}
+
+fn file_is_plausible(path: &Path, name: &str) -> bool {
     std::fs::metadata(path)
-        .map(|m| m.is_file() && m.len() > 10 * 1024 * 1024)
+        .map(|m| m.is_file() && m.len() >= minimum_size(name))
         .unwrap_or(false)
 }
 
@@ -338,7 +395,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.toggle_hotkey, "Ctrl+Alt+Space");
         assert_eq!(c.bullet_hotkey, "Ctrl+Alt+B");
-        assert_eq!(c.model, ModelSize::Small);
+        assert_eq!(c.model, SpeechModel::Nemotron);
         assert_eq!(c.theme, ThemePref::System);
     }
 
@@ -387,13 +444,13 @@ mod tests {
     #[test]
     fn config_survives_a_round_trip_through_json() {
         let mut c = Config::default();
-        c.model = ModelSize::Medium;
+        c.model = SpeechModel::Eou;
         c.theme = ThemePref::Dark;
         c.zoom = 1.5;
         c.input_device = Some("Headset Mic".into());
         let json = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.model, ModelSize::Medium);
+        assert_eq!(back.model, SpeechModel::Eou);
         assert_eq!(back.theme, ThemePref::Dark);
         assert_eq!(back.zoom, 1.5);
         assert_eq!(back.input_device.as_deref(), Some("Headset Mic"));
@@ -405,17 +462,79 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(c.theme, ThemePref::Dark);
         assert_eq!(c.toggle_hotkey, "Ctrl+Alt+Space");
-        assert_eq!(c.model, ModelSize::Small);
+        assert_eq!(c.model, SpeechModel::Nemotron);
     }
 
     #[test]
-    fn model_file_names_are_the_english_ggml_ones() {
-        assert_eq!(ModelSize::Small.file_name(), "ggml-small.en.bin");
-        assert_eq!(ModelSize::Tiny.file_name(), "ggml-tiny.en.bin");
-        for size in ModelSize::ALL {
-            assert!(size.file_name().starts_with("ggml-"));
-            assert!(size.file_name().ends_with(".en.bin"));
+    fn every_model_names_the_files_it_needs() {
+        for model in SpeechModel::ALL {
+            let files = model.files();
+            assert!(!files.is_empty(), "{model:?} lists no files");
+            // Both are ONNX exports with an encoder and a joined decoder.
+            assert!(files.contains(&"encoder.onnx"), "{model:?} has no encoder");
+            assert!(files.contains(&"decoder_joint.onnx"), "{model:?} has no decoder");
+            assert!(!model.dir_name().is_empty());
+            assert!(!model.remote_dir().is_empty());
         }
+    }
+
+    #[test]
+    fn the_two_models_do_not_share_a_folder() {
+        assert_ne!(
+            SpeechModel::Nemotron.dir_name(),
+            SpeechModel::Eou.dir_name()
+        );
+    }
+
+    #[test]
+    fn a_model_folder_missing_a_file_is_not_complete() {
+        let dir = std::env::temp_dir().join("voice-notepad-model-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = SpeechModel::Eou;
+        assert!(!model_is_complete(model, &dir), "empty folder counted as complete");
+
+        for name in model.files() {
+            std::fs::write(dir.join(name), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }
+        assert!(model_is_complete(model, &dir));
+
+        // A truncated weights file is the shape a failed download leaves.
+        std::fs::write(dir.join("encoder.onnx"), vec![0u8; 4096]).unwrap();
+        assert!(
+            !model_is_complete(model, &dir),
+            "a truncated .onnx counted as complete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_small_config_file_is_not_mistaken_for_a_truncated_one() {
+        // Nemotron's config.json is 980 bytes. A flat size floor rejected the
+        // whole model because of it, and the app then insisted the model had
+        // not downloaded.
+        let dir = std::env::temp_dir().join("voice-notepad-small-config-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = SpeechModel::Nemotron;
+
+        for name in model.files() {
+            let bytes = if name.ends_with(".onnx") || name.ends_with(".data") {
+                2 * 1024 * 1024
+            } else {
+                980 // the real size of config.json
+            };
+            std::fs::write(dir.join(name), vec![0u8; bytes]).unwrap();
+        }
+        assert!(
+            model_is_complete(model, &dir),
+            "a model with a small config.json was judged incomplete"
+        );
+
+        // Empty is still wrong, however small the file is meant to be.
+        std::fs::write(dir.join("config.json"), b"").unwrap();
+        assert!(!model_is_complete(model, &dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

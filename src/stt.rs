@@ -1,88 +1,47 @@
-//! The speech engine: one background thread that owns the microphone and
-//! whisper.cpp, and talks to the UI over channels.
+//! The speech engine: one background thread that owns the microphone and the
+//! recogniser, and talks to the window over channels.
 //!
-//! Why one thread owns both: cpal's `Stream` is not `Send` on Windows, and the
-//! Whisper state is expensive to create. Keeping them together means the UI
-//! never touches either, so the UI thread cannot be blocked by a model load or
-//! an inference pass.
+//! The recogniser is a *streaming* model. Audio goes in one fixed-size chunk
+//! at a time and text comes back as it is recognised, with the model keeping
+//! its own state between chunks. Nothing here cuts speech into phrases, and
+//! nothing re-transcribes anything: text is emitted once and appended.
 //!
-//! How live text works. While a phrase is being spoken the whole phrase so far
-//! is re-transcribed every [`PARTIAL_INTERVAL`] and sent as [`Event::Partial`].
-//! The UI holds that text in a known range and swaps it for each better guess,
-//! so the words visibly firm up as you keep talking. When the voice detector
-//! says the phrase is over, one last pass is sent as [`Event::Final`] and the
-//! text stops moving.
+//! That is the whole point of this design. The previous engine wrapped
+//! Whisper, which only understands complete thirty-second clips, so it had to
+//! detect silences, cut the speech into phrases and transcribe each phrase on
+//! its own -- which is exactly why dictation came out as disconnected
+//! fragments. A streaming model removes the need for any of it.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
-};
+use parakeet_rs::{ExecutionConfig, Nemotron, ParakeetEOU, ParakeetEOUHandle};
 
 use crate::audio::{self, AudioError, SharedAudio};
-use crate::config::{find_model, model_dir, ModelSize};
+use crate::config::{find_model, model_dir, SpeechModel};
 use crate::model;
-use crate::resample::WHISPER_SAMPLE_RATE;
-use crate::transcript::{clean_transcript, pad_for_inference};
-use crate::vad::{Vad, VadEvent, FRAME_SAMPLES};
+use crate::resample::rms;
 
-/// How often the in-progress phrase is re-transcribed.
-const PARTIAL_INTERVAL: Duration = Duration::from_millis(700);
 
-/// Don't bother transcribing less speech than this.
-const MIN_PHRASE_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize / 2;
+/// How long to wait for the first audio before deciding the microphone is not
+/// actually delivering anything. Some devices open successfully and then stay
+/// silent, which is indistinguishable from a broken app unless we say so.
+const AUDIO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Whisper only looks at the first 30 s of a clip, so a phrase with no pause
-/// in it has to be committed rather than silently lose its tail. 15 s also
-/// bounds the cost of a partial, since each one re-transcribes the whole
-/// phrase so far.
-const MAX_PHRASE_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * 15;
-
-/// Audio kept before the voice detector fires, so phrase onsets are not
-/// clipped. 10 frames is 200 ms.
-const PREROLL_FRAMES: usize = 10;
-
-/// Whisper's encoder window, in frames: 30 seconds at 50 frames per second.
-const FULL_AUDIO_CTX: usize = 1500;
-
-/// Never give the encoder less context than this, however short the phrase.
-///
-/// Measured on whisper.cpp's jfk.wav with small.en, per phrase: the full 1500
-/// takes 2.0 s, 256 takes 0.3 s but starts repeating itself ("Ask not. Ask
-/// not."), 512 takes 0.5 s and matches the full-context text exactly, and 768
-/// takes 0.9 s for no further gain. Whisper's position embeddings are trained
-/// on the full window, so cutting too close to the audio degrades it.
-const MIN_AUDIO_CTX: usize = 512;
-
-/// How much encoder context a clip of this length actually needs.
-///
-/// Whisper pads every clip to 30 seconds and, left alone, encodes all of it --
-/// so a three second phrase spends most of its time encoding silence. Telling
-/// it how much of the window is real is the single biggest speed win
-/// available here, and it costs nothing in accuracy as long as the figure
-/// covers the audio with room to spare.
-///
-/// Samples map to encoder frames at 320 samples each (160-sample hop, halved
-/// again by the convolution stride).
-fn audio_ctx_for(samples: usize) -> std::ffi::c_int {
-    let frames = samples / 320;
-    // Margin for the mel padding and the tail of the final window.
-    let rounded = (frames + 96).div_ceil(64) * 64;
-    rounded.clamp(MIN_AUDIO_CTX, FULL_AUDIO_CTX) as std::ffi::c_int
-}
+/// Silent chunks pushed through on stop, to flush the model's tail out.
+const FLUSH_CHUNKS: usize = 3;
 
 /// What the UI asks of the engine.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Make sure the model file is on disk, downloading it if needed.
+    /// Make sure the model is on disk, downloading it if needed.
     EnsureModel,
     StartListening,
     StopListening,
     /// Microphone name, or `None` for the system default.
     SetDevice(Option<String>),
-    SetModel(ModelSize),
+    SetModel(SpeechModel),
     Shutdown,
 }
 
@@ -91,17 +50,16 @@ pub enum Command {
 pub enum Event {
     /// First-run download progress.
     ModelDownload(model::Progress),
-    /// The model file is present and being loaded into memory.
+    /// The model is present and being loaded into memory.
     ModelLoading,
     /// Ready to transcribe.
     ModelReady,
     /// Listening started or stopped. The engine is the authority on this, so
     /// a failure to open the microphone turns the mic button back to grey.
     Listening(bool),
-    /// The phrase in progress, to replace whatever partial is on screen.
-    Partial(String),
-    /// The phrase is finished; this text is permanent.
-    Final(String),
+    /// Recognised text, to append at the cursor. Already final -- a streaming
+    /// model does not revise what it has emitted.
+    Text(String),
     /// Input level, for the meter in Settings.
     Level(f32),
     /// Something went wrong, in words fit to show the user.
@@ -117,14 +75,18 @@ pub struct SpeechEngine {
 
 impl SpeechEngine {
     /// Start the engine thread. It idles until told to do something.
-    pub fn spawn(model: ModelSize, device: Option<String>) -> Self {
+    ///
+    /// `ctx` is how the engine wakes the window. The UI only runs when
+    /// something asks it to, so an event sent without a repaint request sits
+    /// in the channel unread.
+    pub fn spawn(model: SpeechModel, device: Option<String>, ctx: egui::Context) -> Self {
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let (event_tx, events) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("voice-notepad-speech".into())
             .spawn(move || {
-                let mut worker = Worker::new(model, device, event_tx);
+                let mut worker = Worker::new(model, device, event_tx, ctx);
                 worker.run(command_rx);
             })
             .ok();
@@ -165,65 +127,134 @@ impl Drop for SpeechEngine {
 }
 
 // ---------------------------------------------------------------------------
+// the recogniser
+// ---------------------------------------------------------------------------
+
+/// The two streaming models behind one interface.
+///
+/// Public so the `transcribe-file` example can drive exactly the same code
+/// the microphone does, which is how the speed and accuracy numbers in
+/// HANDOFF.md were measured.
+pub enum Recogniser {
+    Nemotron(Box<Nemotron>),
+    /// The handle is kept so the stream can be restarted: unlike Nemotron,
+    /// the EOU model has no reset of its own.
+    Eou {
+        handle: Box<ParakeetEOUHandle>,
+        stream: Box<ParakeetEOU>,
+    },
+}
+
+impl Recogniser {
+    /// Load `model` from a folder of ONNX files.
+    pub fn load(model: SpeechModel, dir: &std::path::Path) -> Result<Self, String> {
+        // ONNX Runtime allows exactly one environment per process, so it is
+        // built once and shared.
+        let config = ExecutionConfig::new().with_environment(
+            parakeet_rs::ort::init()
+                .build()
+                .map_err(|e| format!("ONNX Runtime could not start: {e}"))?,
+        );
+
+        match model {
+            SpeechModel::Nemotron => {
+                let loaded = Nemotron::from_pretrained(dir, Some(config))
+                    .map_err(|e| format!("{e}"))?;
+                Ok(Recogniser::Nemotron(Box::new(loaded)))
+            }
+            SpeechModel::Eou => {
+                let handle = ParakeetEOUHandle::from_pretrained(dir, Some(config))
+                    .map_err(|e| format!("{e}"))?;
+                let stream = ParakeetEOU::from_shared(&handle);
+                Ok(Recogniser::Eou {
+                    handle: Box::new(handle),
+                    stream: Box::new(stream),
+                })
+            }
+        }
+    }
+
+    /// How much audio this model wants at a time.
+    pub fn chunk_samples(&self) -> usize {
+        match self {
+            Recogniser::Nemotron(model) => model.chunk_samples(),
+            // The EOU model documents 160 ms chunks and has no accessor.
+            Recogniser::Eou { .. } => 2560,
+        }
+    }
+
+    /// Feed one chunk and get back whatever text it produced. The spacing of
+    /// the result is meaningful; see [`crate::transcript::join_fragment`].
+    pub fn transcribe_chunk(&mut self, chunk: &[f32]) -> Result<String, String> {
+        let text = match self {
+            Recogniser::Nemotron(model) => model.transcribe_chunk(chunk),
+            // `reset_on_eou` is false deliberately: the crate's author reports
+            // it behaving poorly in practice, and for dictation an
+            // end-of-utterance is not a reason to forget context anyway.
+            Recogniser::Eou { stream, .. } => stream.transcribe(chunk, false),
+        };
+        text.map_err(|e| format!("Transcription failed: {e}"))
+    }
+
+    /// Forget what has been said so far, for a fresh listening session.
+    pub fn reset(&mut self) {
+        match self {
+            Recogniser::Nemotron(model) => model.reset(),
+            Recogniser::Eou { handle, stream } => {
+                **stream = ParakeetEOU::from_shared(handle);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 struct Worker {
     events: Sender<Event>,
-    model_size: ModelSize,
+    /// Used only to wake the window after sending an event.
+    ctx: egui::Context,
+    model: SpeechModel,
     device: Option<String>,
 
-    context: Option<WhisperContext>,
-    /// Reused across inferences. Creating one allocates close to 200 MB of
-    /// KV cache and compute buffers, so doing it per phrase -- which is what
-    /// this used to do -- cost more than the inference itself on a slower
-    /// machine.
-    state: Option<WhisperState>,
-    /// Set when the model on disk no longer matches `model_size`.
-    context_stale: bool,
+    recogniser: Option<Recogniser>,
+    /// Set when the loaded recogniser no longer matches `model`.
+    stale: bool,
 
     audio_queue: SharedAudio,
     capture: Option<audio::Capture>,
+    /// Audio not yet making up a whole chunk.
+    pending: Vec<f32>,
 
-    vad: Vad,
-    /// Speech collected for the phrase in progress.
-    phrase: Vec<f32>,
-    /// Rolling pre-onset audio, so a phrase does not start clipped.
-    preroll: std::collections::VecDeque<f32>,
-    /// Samples not yet whole frames.
-    frame_fill: Vec<f32>,
-
-    last_partial: Instant,
-    partial_sent: bool,
-    threads: i32,
+    last_audio: Instant,
+    audio_warned: bool,
 }
 
 impl Worker {
-    fn new(model_size: ModelSize, device: Option<String>, events: Sender<Event>) -> Self {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8) as i32)
-            .unwrap_or(4)
-            .max(1);
-
+    fn new(
+        model: SpeechModel,
+        device: Option<String>,
+        events: Sender<Event>,
+        ctx: egui::Context,
+    ) -> Self {
         Worker {
             events,
-            model_size,
+            ctx,
+            model,
             device,
-            context: None,
-            state: None,
-            context_stale: false,
+            recogniser: None,
+            stale: false,
             audio_queue: audio::shared_audio(),
             capture: None,
-            vad: Vad::new(),
-            phrase: Vec::new(),
-            preroll: std::collections::VecDeque::new(),
-            frame_fill: Vec::new(),
-            last_partial: Instant::now(),
-            partial_sent: false,
-            threads,
+            pending: Vec::new(),
+            last_audio: Instant::now(),
+            audio_warned: false,
         }
     }
 
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
+        // Nothing reads the channel until the window runs again.
+        self.ctx.request_repaint();
     }
 
     fn run(&mut self, commands: Receiver<Command>) {
@@ -258,24 +289,22 @@ impl Worker {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::EnsureModel => self.ensure_model_file(),
+            Command::EnsureModel => self.ensure_model_files(),
             Command::StartListening => self.start_listening(),
             Command::StopListening => self.stop_listening(),
             Command::SetDevice(device) => {
                 self.device = device;
                 if self.capture.is_some() {
-                    // Re-open on the new device.
                     self.stop_listening();
                     self.start_listening();
                 }
             }
-            Command::SetModel(size) => {
-                if size != self.model_size {
-                    self.model_size = size;
-                    self.context = None;
-                    self.state = None;
-                    self.context_stale = true;
-                    self.ensure_model_file();
+            Command::SetModel(model) => {
+                if model != self.model {
+                    self.model = model;
+                    self.recogniser = None;
+                    self.stale = true;
+                    self.ensure_model_files();
                 }
             }
             Command::Shutdown => {}
@@ -283,11 +312,9 @@ impl Worker {
     }
 
     /// Download the model if it is not already on disk.
-    fn ensure_model_file(&mut self) {
-        if find_model(self.model_size).is_some() {
-            self.emit(Event::ModelDownload(model::Progress::Done(
-                find_model(self.model_size).unwrap_or_default(),
-            )));
+    fn ensure_model_files(&mut self) {
+        if let Some(path) = find_model(self.model) {
+            self.emit(Event::ModelDownload(model::Progress::Done(path)));
             return;
         }
         let Some(dir) = model_dir() else {
@@ -298,15 +325,18 @@ impl Worker {
         };
 
         let events = self.events.clone();
-        let size = self.model_size;
+        let ctx = self.ctx.clone();
+        let wanted = self.model;
         // Downloading on its own thread keeps the engine responsive, so the
-        // mic button and Settings still work while a 466 MB file comes down.
+        // mic button and Settings still work while gigabytes come down.
         std::thread::Builder::new()
             .name("voice-notepad-download".into())
             .spawn(move || {
                 let reporter = events.clone();
-                let result = model::download(size, &dir, move |progress| {
+                let reporter_ctx = ctx.clone();
+                let result = model::download(wanted, &dir, move |progress| {
                     let _ = reporter.send(Event::ModelDownload(progress));
+                    reporter_ctx.request_repaint();
                 });
                 if let Err(message) = result {
                     let _ = events.send(Event::ModelDownload(model::Progress::Failed(
@@ -314,17 +344,18 @@ impl Worker {
                     )));
                     let _ = events.send(Event::Error(message));
                 }
+                ctx.request_repaint();
             })
             .ok();
     }
 
-    /// Load the model into memory. Slow (a second or two), so it happens here
-    /// on the engine thread rather than on the UI thread.
-    fn ensure_context(&mut self) -> bool {
-        if self.context.is_some() && self.state.is_some() && !self.context_stale {
+    /// Load the model into memory. Slow, so it happens here on the engine
+    /// thread rather than on the UI thread.
+    fn ensure_recogniser(&mut self) -> bool {
+        if self.recogniser.is_some() && !self.stale {
             return true;
         }
-        let Some(path) = find_model(self.model_size) else {
+        let Some(path) = find_model(self.model) else {
             self.emit(Event::Error(
                 "The speech model has not finished downloading yet.".into(),
             ));
@@ -332,31 +363,17 @@ impl Worker {
         };
 
         self.emit(Event::ModelLoading);
-        let params = WhisperContextParameters::default();
-        match WhisperContext::new_with_params(&path, params) {
-            Ok(context) => {
-                // Build the state once, here, where the wait is already
-                // expected rather than in the middle of a phrase.
-                match context.create_state() {
-                    Ok(state) => {
-                        self.state = Some(state);
-                        self.context = Some(context);
-                        self.context_stale = false;
-                        self.emit(Event::ModelReady);
-                        true
-                    }
-                    Err(err) => {
-                        self.emit(Event::Error(format!(
-                            "The speech recogniser could not be started: {err}"
-                        )));
-                        false
-                    }
-                }
+        match Recogniser::load(self.model, &path) {
+            Ok(recogniser) => {
+                self.recogniser = Some(recogniser);
+                self.stale = false;
+                self.emit(Event::ModelReady);
+                true
             }
             Err(err) => {
                 self.emit(Event::Error(format!(
                     "The speech model at {} could not be loaded ({err}). Try choosing a \
-                     different model size in Settings.",
+                     different model in Settings.",
                     path.display()
                 )));
                 false
@@ -368,7 +385,7 @@ impl Worker {
         if self.capture.is_some() {
             return;
         }
-        if !self.ensure_context() {
+        if !self.ensure_recogniser() {
             self.emit(Event::Listening(false));
             return;
         }
@@ -376,11 +393,12 @@ impl Worker {
         if let Ok(mut queue) = self.audio_queue.lock() {
             queue.clear();
         }
-        self.vad = Vad::new();
-        self.phrase.clear();
-        self.preroll.clear();
-        self.frame_fill.clear();
-        self.partial_sent = false;
+        self.pending.clear();
+        if let Some(recogniser) = self.recogniser.as_mut() {
+            recogniser.reset();
+        }
+        self.last_audio = Instant::now();
+        self.audio_warned = false;
 
         match audio::start(self.device.as_deref(), Arc::clone(&self.audio_queue)) {
             Ok(capture) => {
@@ -412,245 +430,141 @@ impl Worker {
     }
 
     fn stop_listening(&mut self) {
-        let was_listening = self.capture.take().is_some();
-        if !was_listening {
+        if self.capture.take().is_none() {
             return;
         }
-        // Dropping the capture stops the callback; commit whatever was said.
-        if self.phrase.len() >= MIN_PHRASE_SAMPLES {
-            self.commit_phrase();
-        } else {
-            self.phrase.clear();
-            self.partial_sent = false;
-            // Clear any partial still showing on screen.
-            self.emit(Event::Final(String::new()));
-        }
+        // The stream is stopped; push silence through so the last few words
+        // still held in the model's cache come out.
+        self.flush();
+        self.pending.clear();
         self.emit(Event::Listening(false));
     }
 
-    /// Move audio out of the capture queue, run the detector, and transcribe.
+    /// Move audio out of the capture queue and feed it to the recogniser a
+    /// chunk at a time.
     fn pump_audio(&mut self) {
         let incoming: Vec<f32> = match self.audio_queue.lock() {
             Ok(mut queue) => queue.drain(..).collect(),
             Err(_) => return,
         };
-        if !incoming.is_empty() {
-            self.frame_fill.extend_from_slice(&incoming);
+
+        if incoming.is_empty() {
+            // Opening a device can succeed and then deliver nothing at all --
+            // a muted input, or one the system has handed to something else.
+            if !self.audio_warned && self.last_audio.elapsed() > AUDIO_TIMEOUT {
+                self.audio_warned = true;
+                let device = self
+                    .capture
+                    .as_ref()
+                    .map(|c| c.device_name.clone())
+                    .unwrap_or_else(|| "the microphone".to_string());
+                self.emit(Event::Error(format!(
+                    "No sound is arriving from \"{device}\". Check that it is not muted, \
+                     that the system is set to use it, and that nothing else has taken \
+                     it. You can pick a different microphone in Settings."
+                )));
+            }
+            return;
         }
 
-        let mut consumed = 0;
-        while self.frame_fill.len() - consumed >= FRAME_SAMPLES {
-            let frame_start = consumed;
-            consumed += FRAME_SAMPLES;
-            let frame: &[f32] = &self.frame_fill[frame_start..consumed];
+        self.last_audio = Instant::now();
+        self.audio_warned = false;
+        self.emit(Event::Level(rms(&incoming)));
+        self.pending.extend_from_slice(&incoming);
 
-            match self.vad.push_frame(frame) {
-                VadEvent::Silence => {
-                    self.preroll.extend(frame.iter().copied());
-                    let cap = PREROLL_FRAMES * FRAME_SAMPLES;
-                    while self.preroll.len() > cap {
-                        self.preroll.pop_front();
-                    }
-                }
-                VadEvent::SpeechStarted => {
-                    self.phrase.clear();
-                    self.phrase.extend(self.preroll.iter().copied());
-                    self.preroll.clear();
-                    self.phrase.extend_from_slice(frame);
-                    self.last_partial = Instant::now();
-                }
-                VadEvent::Speech => self.phrase.extend_from_slice(frame),
-                VadEvent::SpeechEnded => {
-                    self.phrase.extend_from_slice(frame);
-                    // Drop what we have consumed before a slow inference, so
-                    // the queue does not look stale afterwards.
-                    self.frame_fill.drain(..consumed);
-                    consumed = 0;
-                    self.commit_phrase();
+        let chunk_samples = match self.recogniser.as_ref() {
+            Some(recogniser) => recogniser.chunk_samples(),
+            None => return,
+        };
+
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= chunk_samples {
+            let start = consumed;
+            consumed += chunk_samples;
+            // Disjoint borrows: the recogniser and the buffer are separate
+            // fields, so this needs no copy of the chunk.
+            let text = match self.recogniser.as_mut() {
+                Some(recogniser) => recogniser.transcribe_chunk(&self.pending[start..consumed]),
+                None => break,
+            };
+            match text {
+                Ok(text) => self.emit_text(&text),
+                Err(message) => {
+                    self.emit(Event::Error(message));
+                    break;
                 }
             }
         }
         if consumed > 0 {
-            self.frame_fill.drain(..consumed);
-        }
-
-        self.emit(Event::Level(self.vad.level()));
-
-        if self.vad.in_speech() && self.phrase.len() >= MAX_PHRASE_SAMPLES {
-            // A phrase with no pause in it; commit and carry on in a new one.
-            self.commit_phrase();
-            self.vad.reset_phrase();
-            return;
-        }
-
-        if self.vad.in_speech()
-            && self.phrase.len() >= MIN_PHRASE_SAMPLES
-            && self.last_partial.elapsed() >= PARTIAL_INTERVAL
-        {
-            if let Some(text) = self.transcribe(true) {
-                self.partial_sent = true;
-                self.emit(Event::Partial(text));
-            }
-            // Timed from when the pass *finished*, not when it started. On a
-            // slow machine an inference can outlast the interval, and timing
-            // from the start would leave no gap at all: partials would run
-            // back to back, the audio queue would not be drained, and the
-            // window would feel stuck.
-            self.last_partial = Instant::now();
+            self.pending.drain(..consumed);
         }
     }
 
-    /// Transcribe the phrase and send it as permanent text.
-    fn commit_phrase(&mut self) {
-        if self.phrase.len() < MIN_PHRASE_SAMPLES {
-            if self.partial_sent {
-                // Retract a partial that turned out to be nothing.
-                self.emit(Event::Final(String::new()));
-                self.partial_sent = false;
-            }
-            self.phrase.clear();
+    /// Push silence through to get the tail of the last words out.
+    fn flush(&mut self) {
+        let Some(chunk_samples) = self.recogniser.as_ref().map(|r| r.chunk_samples()) else {
             return;
+        };
+        // Whatever is left over, padded out to a whole chunk.
+        if !self.pending.is_empty() {
+            let mut last = std::mem::take(&mut self.pending);
+            last.resize(chunk_samples.max(last.len()), 0.0);
+            for chunk in last.chunks(chunk_samples) {
+                if chunk.len() < chunk_samples {
+                    break;
+                }
+                if let Some(recogniser) = self.recogniser.as_mut() {
+                    if let Ok(text) = recogniser.transcribe_chunk(chunk) {
+                        self.emit_text(&text);
+                    }
+                }
+            }
         }
-        let text = self.transcribe(false).unwrap_or_default();
-        self.emit(Event::Final(text));
-        self.partial_sent = false;
-        self.phrase.clear();
+
+        let silence = vec![0.0f32; chunk_samples];
+        for _ in 0..FLUSH_CHUNKS {
+            let text = match self.recogniser.as_mut() {
+                Some(recogniser) => recogniser.transcribe_chunk(&silence),
+                None => return,
+            };
+            if let Ok(text) = text {
+                self.emit_text(&text);
+            }
+        }
     }
 
-    /// Run whisper.cpp over the current phrase.
+    /// Pass the fragment on exactly as the model emitted it.
     ///
-    /// `partial` asks for one segment and a cheaper search, because the result
-    /// is about to be replaced anyway.
-    fn transcribe(&mut self, partial: bool) -> Option<String> {
-        let threads = self.threads;
-        let phrase = std::mem::take(&mut self.phrase);
-        let result = match self.state.as_mut() {
-            Some(state) => transcribe_clip(state, &phrase, partial, threads),
-            None => Err("The speech recogniser is not loaded.".to_string()),
-        };
-        self.phrase = phrase;
+    /// The spacing matters and must survive to the UI: a leading space is the
+    /// only thing that distinguishes a new word from the rest of the current
+    /// one. Annotations are stripped at the point of insertion, by
+    /// `transcript::join_fragment`.
+    fn emit_text(&self, raw: &str) {
+        if !raw.is_empty() {
+            self.emit(Event::Text(raw.to_string()));
+        }
+    }
+}
 
-        match result {
-            Ok(text) => Some(text),
-            Err(message) => {
-                self.emit(Event::Error(message));
-                None
+/// Make sure ONNX Runtime can be found before anything tries to use it.
+///
+/// On Windows the runtime is a DLL loaded at startup rather than linked in,
+/// because Microsoft ships no MinGW build to link against. It lives beside
+/// the exe, and this points the loader at it. Elsewhere it is linked
+/// statically and there is nothing to do.
+pub fn prepare_runtime() {
+    #[cfg(windows)]
+    {
+        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+            return;
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let dll = dir.join("onnxruntime.dll");
+                if dll.is_file() {
+                    std::env::set_var("ORT_DYLIB_PATH", dll);
+                }
             }
         }
-    }
-}
-
-/// Transcribe one clip of 16 kHz mono audio.
-///
-/// This is the single place Whisper is configured, so the `transcribe-file`
-/// example exercises exactly what live dictation does. Every parameter that
-/// could produce a timestamp, a speaker label or a segment marker is turned
-/// off here, and [`clean_transcript`] scrubs the result as well.
-///
-/// Each phrase is decoded on its own, with no carried-over prompt: feeding
-/// the previous text back as context measured no better on the test clip and
-/// leaks a `CString` per call in whisper-rs 0.16.
-pub fn transcribe_clip(
-    state: &mut WhisperState,
-    samples: &[f32],
-    partial: bool,
-    threads: i32,
-) -> Result<String, String> {
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(threads);
-    params.set_language(Some("en"));
-    params.set_translate(false);
-    params.set_no_context(true);
-    // Everything below is what keeps timestamps and markers out.
-    params.set_no_timestamps(true);
-    params.set_token_timestamps(false);
-    params.set_print_timestamps(false);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_tdrz_enable(false);
-    params.set_suppress_blank(true);
-    params.set_single_segment(partial);
-    if partial {
-        params.set_temperature(0.0);
-        params.set_temperature_inc(0.0);
-    }
-
-    // See audio_ctx_for: do not make the encoder chew through the silence
-    // Whisper pads every clip with.
-    let audio = pad_for_inference(samples);
-    params.set_audio_ctx(audio_ctx_for(audio.len()));
-
-    state
-        .full(params, &audio)
-        .map_err(|err| format!("Transcription failed: {err}"))?;
-
-    let mut text = String::new();
-    for i in 0..state.full_n_segments() {
-        let Some(segment) = state.get_segment(i) else {
-            continue;
-        };
-        if let Ok(piece) = segment.to_str_lossy() {
-            text.push_str(&piece);
-            text.push(' ');
-        }
-    }
-
-    Ok(clean_transcript(&text))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resample::WHISPER_SAMPLE_RATE;
-
-    fn seconds(s: f32) -> usize {
-        (WHISPER_SAMPLE_RATE as f32 * s) as usize
-    }
-
-    #[test]
-    fn short_phrases_get_the_minimum_encoder_context() {
-        // Below the floor the model starts repeating itself; see MIN_AUDIO_CTX.
-        assert_eq!(audio_ctx_for(seconds(1.0)), MIN_AUDIO_CTX as i32);
-        assert_eq!(audio_ctx_for(seconds(3.0)), MIN_AUDIO_CTX as i32);
-        assert_eq!(audio_ctx_for(0), MIN_AUDIO_CTX as i32);
-    }
-
-    #[test]
-    fn long_phrases_get_more_context_in_proportion() {
-        let ten = audio_ctx_for(seconds(10.0));
-        let twenty = audio_ctx_for(seconds(20.0));
-        assert!(ten > MIN_AUDIO_CTX as i32, "10s should need more than the floor");
-        assert!(twenty > ten, "20s should need more context than 10s");
-    }
-
-    #[test]
-    fn encoder_context_never_exceeds_the_models_window() {
-        // Whisper asserts on anything above its trained window.
-        assert_eq!(audio_ctx_for(seconds(30.0)), FULL_AUDIO_CTX as i32);
-        assert_eq!(audio_ctx_for(seconds(120.0)), FULL_AUDIO_CTX as i32);
-    }
-
-    #[test]
-    fn context_always_covers_the_audio_with_room_to_spare() {
-        // The whole point: too small and the tail of the phrase is cut off.
-        for secs in [1.0f32, 2.5, 5.0, 8.0, 12.0, 15.0, 25.0] {
-            let samples = seconds(secs);
-            let needed = (samples / 320) as i32;
-            let given = audio_ctx_for(samples);
-            assert!(
-                given >= needed + 64,
-                "{secs}s needs {needed} frames but was given only {given}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_phrase_at_the_hard_commit_limit_still_fits() {
-        // MAX_PHRASE_SAMPLES is the longest clip the live path can produce.
-        let given = audio_ctx_for(MAX_PHRASE_SAMPLES);
-        let needed = (MAX_PHRASE_SAMPLES / 320) as i32;
-        assert!(given >= needed + 64);
-        assert!(given <= FULL_AUDIO_CTX as i32);
     }
 }

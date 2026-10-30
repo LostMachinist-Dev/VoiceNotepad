@@ -54,7 +54,15 @@ impl Resampler {
 
         // Discard what we are past, keeping the sample the next interpolation
         // still needs.
-        let consumed = self.pos.floor() as usize;
+        //
+        // The read position can finish beyond the end of what we hold: the
+        // last output sample advances `pos` by a whole step from somewhere
+        // inside the buffer, and for a step above 1.0 that can land past it.
+        // Clamping is what keeps that from panicking -- carrying the overshoot
+        // in `pos` is correct, because it means the next block starts that far
+        // in. Getting this wrong crashed the moment a 44.1 kHz microphone was
+        // switched on.
+        let consumed = (self.pos.floor() as usize).min(self.carry.len());
         if consumed > 0 {
             self.carry.drain(..consumed);
             self.pos -= consumed as f64;
@@ -143,5 +151,46 @@ mod tests {
         assert!(rms(&[0.0; 100]).abs() < 1e-9);
         assert!((rms(&[1.0, -1.0, 1.0, -1.0]) - 1.0).abs() < 1e-6);
         assert!(rms(&[0.1; 50]) < rms(&[0.5; 50]));
+    }
+}
+
+#[cfg(test)]
+mod regression {
+    use super::*;
+
+    #[test]
+    fn stays_on_rate_at_44_1khz_in_small_blocks() {
+        // 44.1 kHz is what triggered the overshoot, and clamping it must not
+        // quietly drop or duplicate audio: one second in must still be one
+        // second out.
+        for frames in [128usize, 441, 512, 1024] {
+            let mut r = Resampler::new(44_100, 1);
+            let block = vec![0.2f32; frames];
+            let blocks = 44_100 / frames;
+            let total: usize = (0..blocks).map(|_| r.process(&block).len()).sum();
+            let expected = (blocks * frames) as f64 * 16_000.0 / 44_100.0;
+            assert!(
+                (total as f64 - expected).abs() <= 4.0,
+                "{frames}-frame blocks drifted: {total} samples, expected about {expected:.0}"
+            );
+        }
+    }
+
+    #[test]
+    fn survives_every_realistic_rate_and_buffer_size() {
+        // The audio callback hands us whatever size the driver likes, at
+        // whatever rate the device runs. Any combination that panics here is
+        // a crash the moment the microphone is switched on.
+        for rate in [8_000u32, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000] {
+            for channels in [1u16, 2] {
+                for frames in [1usize, 16, 64, 128, 160, 240, 441, 480, 512, 1024, 2048] {
+                    let mut r = Resampler::new(rate, channels);
+                    let block = vec![0.1f32; frames * channels as usize];
+                    for _ in 0..8 {
+                        r.process(&block);
+                    }
+                }
+            }
+        }
     }
 }

@@ -18,6 +18,9 @@ Unicode true
 !ifndef OUTFILE
   !define OUTFILE "VoiceNotepad-Setup.exe"
 !endif
+!ifndef ONNX_DLL
+  !error "ONNX_DLL must be defined (path to onnxruntime.dll)"
+!endif
 !ifndef ASSETS
   !define ASSETS "..\assets"
 !endif
@@ -57,7 +60,7 @@ VIAddVersionKey  "LegalCopyright"  "MIT licensed"
 !insertmacro MUI_PAGE_INSTFILES
 
 !define MUI_FINISHPAGE_TITLE "Voice Notepad is installed"
-!define MUI_FINISHPAGE_TEXT  "Open it from the Start menu.$\r$\n$\r$\nThe first time it runs it downloads the speech model it needs, and shows a progress bar while it does. After that it works entirely offline."
+!define MUI_FINISHPAGE_TEXT  "Open it from the Start menu.$\r$\n$\r$\nThe first time it runs it downloads the speech model, which is large (2.4 GB for the recommended one), and shows a progress bar while it does. You can pick a smaller, faster model in Settings. After the download it works entirely offline."
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -69,6 +72,10 @@ Section "Voice Notepad" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "/oname=${EXENAME}" "${SOURCE_EXE}"
+  ; The speech engine runs on ONNX Runtime, which is loaded from here at
+  ; startup. Microsoft ships no MinGW build to link against, so it travels as
+  ; a DLL beside the exe rather than inside it. MIT licensed.
+  File "/oname=onnxruntime.dll" "${ONNX_DLL}"
   File "/oname=voice-notepad.ico" "${ASSETS}\voice-notepad.ico"
   File "/oname=LICENSE.txt" "${LICENSE_FILE}"
 
@@ -106,6 +113,7 @@ LangString DESC_SecDesktop ${LANG_ENGLISH} "Also put a shortcut on the desktop."
 
 Section "Uninstall"
   Delete "$INSTDIR\${EXENAME}"
+  Delete "$INSTDIR\onnxruntime.dll"
   Delete "$INSTDIR\voice-notepad.ico"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\Uninstall.exe"

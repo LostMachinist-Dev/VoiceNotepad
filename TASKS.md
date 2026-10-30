@@ -19,7 +19,26 @@
 - NSIS installer, per-user, with Start menu entry and a working uninstaller.
 - 102 tests. README, HANDOFF.md, and a study guide in ~/deliverables.
 
-## Done since 1.0.0
+## Done in 2.0.0 - the speech engine was replaced
+- Whisper is gone, and with it the fragmentation. Whisper only understands
+  complete 30-second clips, so the engine had to detect silences, cut speech
+  into phrases and transcribe each one alone - which is exactly why dictation
+  came out in disconnected pieces. NVIDIA Parakeet is a streaming model:
+  audio goes in a chunk at a time and text comes back continuously.
+- Measured on the same clip: Whisper gave "And so, my fellow Americans," /
+  "Ask not." / "What your country can do for you..." as three separate
+  fragments. Parakeet gives one continuous line, and at 3.55x real time.
+- Two models, switchable in Settings: Nemotron streaming (2.4 GB, punctuated)
+  and Realtime EOU (483 MB, much faster, no punctuation or capitals).
+- Deleted outright: the voice activity detector, the phrase assembler, the
+  partial/final replace-in-place machinery, the whisper-rs-sys vendoring and
+  its two cross-compile patches. All of it existed to work around Whisper.
+- Windows loads onnxruntime.dll at runtime (Microsoft ships no MinGW build to
+  link against); the installer puts it beside the exe.
+- Help > About, with version, build target, model and settings paths, and a
+  Copy details button for bug reports. Also `--version`.
+
+## Done in 1.1.0 and 1.2.0
 - Transcription is three to four times faster. Whisper pads every clip to
   thirty seconds and was encoding all of it; it is now told how much of the
   window is real. small.en went from 2.0s to 0.5s per phrase, tiny.en from
@@ -35,6 +54,11 @@
   delivered there, rather than failing silently.
 
 ## Next
+- Use it in anger on both machines. Everything about the new engine has been
+  proven on this box, including real speech through a real microphone, but
+  not on the Windows laptop.
+- Measure whether the Nemotron model keeps up on the laptop. If not, the EOU
+  model in Settings is the answer, at the cost of punctuation.
 - Run it on real Windows. Microphone enumeration, permissions, and whether
   `RegisterHotKey` collides with anything already installed are the parts a
   Wine test cannot really answer.

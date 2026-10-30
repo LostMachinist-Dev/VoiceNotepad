@@ -1,13 +1,9 @@
 [target.x86_64-pc-windows-gnu]
-# The *-posix* mingw variant, not the default win32 one. whisper.cpp uses
-# std::thread, which libstdc++ only provides under the posix threading model,
-# and the win32 variant's libgcc also fails to link here (gthr-win32.o wants
-# __mingwthr_key_dtor, which appears too early in rustc's library order).
-linker = "x86_64-w64-mingw32-gcc-posix"
+linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
 rustflags = [
-    # Keep the exe self-contained: no libgcc_s_seh-1.dll, no libstdc++-6.dll,
-    # no libwinpthread-1.dll beside it.
+    # Keep the exe free of toolchain runtime DLLs. Cheap insurance: there is
+    # no C++ in the build any more, but a dependency could reintroduce some.
     "-C", "link-arg=-static-libgcc",
     "-C", "link-arg=-static-libstdc++",
 ]

@@ -1,11 +1,13 @@
-#include <winver.h>
+/* No #include: every value below is a numeric literal, and pulling in
+   winver.h would need the Windows SDK headers on the include path, which
+   llvm-rc does not have when cross-compiling. */
 
 /* Resource id 1 is what Explorer and the taskbar show for the exe. */
 1 ICON "voice-notepad.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,1,0,0
-PRODUCTVERSION  1,1,0,0
+FILEVERSION     1,2,0,0
+PRODUCTVERSION  1,2,0,0
 FILEOS          0x40004L   /* VOS_NT_WINDOWS32 */
 FILETYPE        0x1L       /* VFT_APP */
 BEGIN
@@ -15,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Voice Notepad"
             VALUE "FileDescription",  "Voice Notepad - Notepad with local speech to text"
-            VALUE "FileVersion",      "1.1.0"
+            VALUE "FileVersion",      "1.2.0"
             VALUE "InternalName",     "VoiceNotepad"
             VALUE "OriginalFilename", "VoiceNotepad.exe"
             VALUE "ProductName",      "Voice Notepad"
-            VALUE "ProductVersion",   "1.1.0"
+            VALUE "ProductVersion",   "1.2.0"
         END
     END
     BLOCK "VarFileInfo"

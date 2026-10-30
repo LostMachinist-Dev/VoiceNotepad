@@ -8,13 +8,13 @@
 //! the behaviour the spec pins down actually lives.
 
 pub mod config;
+pub mod diagnostics;
 pub mod document;
 pub mod markdown;
 pub mod model;
 pub mod platform;
 pub mod resample;
 pub mod transcript;
-pub mod vad;
 
 #[cfg(feature = "app")]
 pub mod audio;

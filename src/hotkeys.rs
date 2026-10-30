@@ -4,6 +4,8 @@
 //! narrate while testing a different GUI -- so they are registered with the OS
 //! rather than handled as egui key events.
 
+use std::sync::{Arc, Mutex};
+
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
@@ -16,23 +18,33 @@ pub enum Action {
     NewBullet,
 }
 
+/// Which registration each press belongs to, shared with the listener thread.
+#[derive(Default)]
+struct Registered {
+    toggle: Option<u32>,
+    bullet: Option<u32>,
+}
+
 /// Holds the OS registrations. Dropping it releases them.
 pub struct Hotkeys {
     manager: Option<GlobalHotKeyManager>,
     toggle: Option<HotKey>,
     bullet: Option<HotKey>,
+    registered: Arc<Mutex<Registered>>,
+    /// Presses the listener thread has seen and the window has not yet read.
+    pending: Arc<Mutex<Vec<Action>>>,
     /// Why the last [`Hotkeys::apply`] did not fully work, if it did not.
     pub warning: Option<String>,
 }
 
-impl Default for Hotkeys {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Hotkeys {
-    pub fn new() -> Self {
+    /// `ctx` is how a press wakes the window.
+    ///
+    /// Presses arrive on a thread of the hotkey library's own, and the window
+    /// only runs when something asks it to. Polling from the draw loop alone
+    /// meant a press while the window sat idle was never noticed -- the whole
+    /// point of a system-wide hotkey is that the window is idle.
+    pub fn new(ctx: egui::Context) -> Self {
         let (manager, warning) = match GlobalHotKeyManager::new() {
             Ok(manager) => (Some(manager), None),
             Err(err) => (
@@ -43,10 +55,52 @@ impl Hotkeys {
                 )),
             ),
         };
+        let registered: Arc<Mutex<Registered>> = Arc::default();
+        let pending: Arc<Mutex<Vec<Action>>> = Arc::default();
+
+        if manager.is_some() {
+            let registered = Arc::clone(&registered);
+            let pending = Arc::clone(&pending);
+            std::thread::Builder::new()
+                .name("voice-notepad-hotkeys".into())
+                .spawn(move || {
+                    let receiver = GlobalHotKeyEvent::receiver();
+                    while let Ok(event) = receiver.recv() {
+                        // Act on press, not release, so holding the key does
+                        // not double up.
+                        if event.state != HotKeyState::Pressed {
+                            continue;
+                        }
+                        let action = {
+                            let ids = match registered.lock() {
+                                Ok(ids) => ids,
+                                Err(_) => break,
+                            };
+                            if Some(event.id) == ids.toggle {
+                                Some(Action::ToggleListening)
+                            } else if Some(event.id) == ids.bullet {
+                                Some(Action::NewBullet)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(action) = action {
+                            if let Ok(mut queue) = pending.lock() {
+                                queue.push(action);
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                })
+                .ok();
+        }
+
         Hotkeys {
             manager,
             toggle: None,
             bullet: None,
+            registered,
+            pending,
             warning,
         }
     }
@@ -70,6 +124,10 @@ impl Hotkeys {
         for old in [self.toggle.take(), self.bullet.take()].into_iter().flatten() {
             let _ = manager.unregister(old);
         }
+        if let Ok(mut ids) = self.registered.lock() {
+            ids.toggle = None;
+            ids.bullet = None;
+        }
 
         let mut problems: Vec<String> = Vec::new();
 
@@ -80,10 +138,14 @@ impl Hotkeys {
             match to_hotkey(spec) {
                 Some(hotkey) => match manager.register(hotkey) {
                     Ok(()) => {
-                        if slot == 0 {
-                            self.toggle = Some(hotkey);
-                        } else {
-                            self.bullet = Some(hotkey);
+                        if let Ok(mut ids) = self.registered.lock() {
+                            if slot == 0 {
+                                self.toggle = Some(hotkey);
+                                ids.toggle = Some(hotkey.id());
+                            } else {
+                                self.bullet = Some(hotkey);
+                                ids.bullet = Some(hotkey.id());
+                            }
                         }
                     }
                     Err(err) => problems.push(format!(
@@ -104,22 +166,10 @@ impl Hotkeys {
 
     /// Everything pressed since the last call.
     pub fn poll(&self) -> Vec<Action> {
-        let mut actions = Vec::new();
-        if self.manager.is_none() {
-            return actions;
+        match self.pending.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => Vec::new(),
         }
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            // Act on press, not release, so holding the key does not double up.
-            if event.state != HotKeyState::Pressed {
-                continue;
-            }
-            if Some(event.id) == self.toggle.map(|h| h.id()) {
-                actions.push(Action::ToggleListening);
-            } else if Some(event.id) == self.bullet.map(|h| h.id()) {
-                actions.push(Action::NewBullet);
-            }
-        }
-        actions
     }
 }
 

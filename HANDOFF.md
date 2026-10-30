@@ -7,9 +7,17 @@ months.
 ## What it is
 
 A Rust desktop app: one window, Notepad's layout and menus, plus a mic button
-that runs whisper.cpp locally and streams the words into the document. Built
-on Linux, cross-compiled to a self-contained 12 MB `VoiceNotepad.exe`, wrapped
-in a 4 MB NSIS installer.
+that runs NVIDIA Parakeet locally and streams the words into the document.
+Built on Linux, cross-compiled to Windows and installed natively here.
+
+**2.0 replaced the speech engine.** Whisper only understands complete
+thirty-second clips, so the old engine detected silences, cut speech into
+phrases and transcribed each one on its own -- which is why dictation came out
+as disconnected fragments. Parakeet is a streaming model: audio goes in a
+chunk at a time, text comes back continuously, and the model keeps its own
+state between chunks. The voice detector, the phrase assembler and the
+partial/final replace-in-place machinery all existed to work around Whisper
+and are gone.
 
 ## How it fits together
 
@@ -20,11 +28,11 @@ src/
   ui.rs          the window: menus, text area, status bar, dialogs
   document.rs    the text model: bullets, indent, cursor-relative edits
   markdown.rs    display <-> markdown, both directions
-  stt.rs         the speech engine thread; owns the mic and whisper.cpp
-  audio.rs       cpal capture
+  stt.rs         the speech engine thread; owns the mic and the recogniser
+  audio.rs       cpal capture, and the microphone self-test
   resample.rs    downmix and rate-convert to 16 kHz mono
-  vad.rs         voice activity detection: where phrases start and stop
-  transcript.rs  scrubbing Whisper's output; padding short clips
+  transcript.rs  scrubbing annotations; joining streaming fragments
+  diagnostics.rs crash logging and the version string
   model.rs       downloading the model with progress
   config.rs      settings, hotkey specs, where things live on disk
   theme.rs       the Notepad look, light and dark
@@ -41,8 +49,8 @@ edits and hotkey edits therefore cannot disagree, because there is only one
 thing to disagree with. The cost is that bullet detection is a string
 operation; `document::parse_line` is the single place it happens.
 
-**One background thread owns the microphone and whisper.cpp.** cpal's `Stream`
-is not `Send` on Windows and a Whisper context is expensive to build, so they
+**One background thread owns the microphone and the recogniser.** cpal's
+`Stream` is not `Send` on Windows and a recogniser is expensive to build, so they
 live together on one thread that talks to the UI over channels
 (`stt::Command` in, `stt::Event` out). The UI thread never touches either, so
 it cannot be blocked by a model load or an inference pass. When not listening
@@ -60,47 +68,60 @@ The UI records what it wrote into that range. If the text there is not what it
 put there - you typed over it, or undid it - it lets go and starts a fresh
 span rather than corrupting your edit.
 
-## Speed
+## Why Parakeet, with numbers
 
-This was the first thing to fix after 1.0.0 shipped: it was usable but slow.
+Measured on whisper.cpp's `jfk.wav`, on this box:
 
-Whisper pads every clip to thirty seconds and, left to itself, encodes the
-whole padded window - so a three second phrase spent most of its time encoding
-silence. `audio_ctx_for` in `stt.rs` tells it how much of the window is real.
+| | Result |
+| --- | --- |
+| Whisper small.en, phrase at a time | `And so, my fellow Americans,` / `Ask not.` / `What your country can do for you, ask what you can do for your country.` -- three fragments |
+| Parakeet Nemotron streaming | `And so, my fellow Americans ask not what your country can do for you ask what you can do for your country` -- one continuous line |
 
-Measured on whisper.cpp's `jfk.wav` with `small.en`, per phrase:
+Speed: 560 ms of audio recognised in 136 ms on average, worst chunk 153 ms.
+3.55x faster than real time on CPU, so it keeps up comfortably. Model load is
+about 1.2 s; resident memory about 2.55 GB with the Nemotron model.
 
-| Encoder context | Time | Text |
-| --- | --- | --- |
-| 1500 (full) | 2.0 s | correct |
-| 768 | 0.9 s | correct |
-| **512** | **0.5 s** | **correct - matches the full-context baseline** |
-| 256 | 0.3 s | repeats itself: "Ask not. Ask not." |
+The two models are in `config::SpeechModel`. Nemotron (2.4 GB) punctuates and
+capitalises; EOU (483 MB) is roughly five times smaller and faster but emits
+neither. There is no quantised export of the streaming Nemotron model, which
+is why the big one is as big as it is.
 
-512 is the floor (`MIN_AUDIO_CTX`). Whisper's position embeddings are trained
-on the full window, so cutting too close to the audio degrades it. `tiny.en`
-went from 0.3 s to 0.1 s and became *more* accurate at the same time.
+## Streaming fragments and their spacing
 
-Two smaller things went with it. The recogniser state is built once and
-reused, rather than per phrase - measured at only 0.01 s, so this was not the
-bottleneck it looked like, but it avoids allocating and freeing close to 200 MB
-every inference. And the gap between partials is timed from when the previous
-pass *finished*; timing from the start meant a pass that outlasted the
-interval left no gap at all, so partials ran back to back and the audio queue
-went undrained.
+The recogniser emits sub-word pieces, and **the leading space on a piece is
+the only thing that distinguishes the start of a new word from the middle of
+the current one**: `polit` + `ical` is one word, `that` + ` is` is two.
 
-If it still feels slow, the model size is the biggest remaining lever, and it
-is a Settings change rather than a code change.
+The first version of this carried the old whole-utterance logic over -- trim
+each piece, join with a space -- and dictation came out as `polit ical star`
+and `two fun ctions`. `transcript::join_fragment` now preserves the model's
+own spacing, dropping a leading space only at the start of a line or straight
+after a bullet marker, where it would read as an indent. If dictation ever
+starts breaking words apart again, that function is where to look.
 
 ## Decisions worth knowing about
 
-**CPU, not GPU.** The spec allowed this if GPU support complicated the
-single-binary goal, and it does: a CUDA or Vulkan build cross-compiled from
-Linux would need the Windows CUDA toolkit or the Windows Vulkan SDK on the
-build box, and would make the exe depend on the matching runtime on the target
-machine. `small.en` on CPU transcribes a phrase in well under the time it took
-to say it, which is what matters here. Changing this means building on Windows
-with `whisper-rs`'s `cuda` or `vulkan` feature.
+**CPU, not GPU.** A CUDA or DirectML build cross-compiled from Linux would
+need the matching Windows toolkits on the build box and the matching runtime
+on the target machine. CPU keeps up at 3.55x real time, which is what matters.
+`parakeet-rs` has `cuda`, `directml` and other execution-provider features if
+this ever needs revisiting.
+
+**ONNX Runtime is linked differently per platform, and has to be.** Linux
+links it statically, so the binary stands alone. Windows cannot: Microsoft
+publishes no MinGW build, so there is nothing to link against when
+cross-compiling, and `ort-sys` fails outright with *no prebuilt binaries
+available for target x86_64-pc-windows-gnu*. The Windows build therefore uses
+`ort`'s `load-dynamic`, which loads `onnxruntime.dll` at runtime instead of
+linking it. `stt::prepare_runtime()` points the loader at the DLL beside the
+exe, and the installer puts it there. `scripts/fetch-onnxruntime.sh` fetches
+it; the version must satisfy the `api-28` feature, so ONNX Runtime 1.28 or
+newer (we ship 1.31.0, matching the static build Linux gets).
+
+The cost is that the Windows deliverable is no longer literally a single file.
+The alternative would be switching the Windows target to MSVC and
+cross-compiling with `cargo-xwin`, which would allow a static ORT; that is the
+route to take if one file ever matters more than a simple toolchain.
 
 **egui/eframe rather than native Win32.** Cross-platform for free, which the
 spec asked for where it is cheap, and it draws a convincing Notepad: flat
@@ -116,16 +137,10 @@ the Windows build at all.
 prompt, and the app never runs elevated - which for something that registers
 global hotkeys and writes to the user's AppData is the right side to be on.
 
-**No carried-over prompt between phrases.** Whisper accepts an initial prompt,
-and feeding it the previous phrase is the usual streaming trick. Measured on
-`jfk.wav` it made no difference, and `whisper-rs` 0.16's `set_initial_prompt`
-leaks a `CString` on every call, which adds up in an app meant to run all day.
-Dropped.
-
-**Pre-roll before the voice detector fires.** This one did matter. Keeping the
-200 ms before speech is detected and prepending it to the phrase was worth
-`and so am i fell america` -> `And so am I fellow Americans` on the test clip.
-Without it the attack of every phrase is clipped and the first word suffers.
+**Panics unwind, they do not abort.** A panic in the audio callback thread
+used to take the whole window down with no message at all. `diagnostics`
+installs a panic hook that writes to a log beside the settings, and Help >
+About says where that log is.
 
 ## Building it
 
@@ -135,12 +150,15 @@ Already present on this box:
 
 ```sh
 # for the Windows cross-build
-sudo apt install g++-mingw-w64-x86-64 mingw-w64-x86-64-dev cmake libclang1-21 unzip wine64
+sudo apt install g++-mingw-w64-x86-64 mingw-w64-x86-64-dev unzip wine64
 rustup target add x86_64-pc-windows-gnu
 
 # additionally, to build and run natively on Linux
 sudo apt install libasound2-dev
 ```
+
+Nothing else: dropping whisper.cpp took cmake and libclang with it, since
+there is no longer any C++ to build or any bindings to generate.
 
 Not needed: NSIS. `scripts/build-installer.sh` fetches the official Windows
 makensis once into `~/.local/share/voicenotepad-build` and runs it under Wine.
@@ -148,7 +166,7 @@ makensis once into `~/.local/share/voicenotepad-build` and runs it under Wine.
 ### The commands
 
 ```sh
-./scripts/build-installer.sh     # everything -> dist/VoiceNotepad-1.1.0-Setup.exe
+./scripts/build-installer.sh     # everything -> dist/VoiceNotepad-2.0.0-Setup.exe
 ./scripts/build-windows.sh       # just the Windows exe
 ./scripts/build-windows.sh debug # ... unoptimised, with a console window
 
@@ -156,72 +174,102 @@ makensis once into `~/.local/share/voicenotepad-build` and runs it under Wine.
 ./scripts/uninstall-linux.sh     # and remove it again
 ```
 
-### The whisper-rs-sys patch
+### The mingw toolchain
 
-`whisper-rs-sys` 0.15 does not cross-compile to `x86_64-pc-windows-gnu` as
-published, for two separate reasons. `scripts/vendor-whisper-sys.py` copies it
-out of the cargo registry into `third_party/` and patches both; `Cargo.toml`
-points `[patch.crates-io]` at that copy. The script is idempotent and the build
-scripts run it for you. `third_party/` is gitignored - delete it and it is
-rebuilt.
+Nothing special any more. Version 1.x needed the `-posix` mingw variant for
+two reasons, both of which belonged to whisper.cpp: libstdc++ only implements
+`std::thread` under that threading model, and the win32 variant's libgcc
+would not link at all (`gthr-win32.o` wants `__mingwthr_key_dtor`, which rustc
+places too late in the library order). With no C++ left in the build, the
+default toolchain links cleanly and is what `.cargo/config.toml` now uses --
+retested, not assumed.
 
-1. **Library naming.** whisper.cpp's `ggml/CMakeLists.txt` strips the `lib`
-   prefix from static libraries on WIN32 ("remove the lib prefix on win32
-   mingw"), producing `ggml.a`. That matches what rustc looks for on MSVC
-   (`ggml.lib`), but on the gnu target rustc resolves `-l static=ggml` to
-   `libggml.a`, so the link fails with *could not find native static library
-   `ggml`*. The patch drops `libX.a` copies next to each `X.a` after the cmake
-   build.
-
-2. **The C++ runtime.** The crate emits `rustc-link-lib=dylib=stdc++`, which
-   would make the exe need `libstdc++-6.dll` beside it. The patch links it
-   statically instead, and asks the compiler (`-print-file-name=libstdc++.a`)
-   where the archive is, because rustc has no idea where mingw keeps it.
-
-If a future `whisper-rs-sys` moves the anchor lines, the script fails loudly
-with which patch no longer applies rather than silently producing a broken
-build.
-
-### The mingw threading model
-
-`.cargo/config.toml` uses `x86_64-w64-mingw32-gcc-posix`, not the default. Two
-reasons, and both are hard failures rather than preferences:
-
-- whisper.cpp uses `std::thread`, which libstdc++ only implements under the
-  posix threading model.
-- The win32 variant's libgcc does not link here at all: `gthr-win32.o` wants
-  `__mingwthr_key_dtor`, which lives in `libmingw32.a`, which rustc places
-  earlier in the library order than `-lgcc`.
-
-`-static-libgcc` and `-static-libstdc++` are passed as link args so nothing
-from the toolchain is needed at runtime. The result imports only Windows
-system DLLs - check with:
+`-static-libgcc` and `-static-libstdc++` are still passed as cheap insurance
+against a dependency reintroducing a runtime dependency. The result imports
+only Windows system DLLs, which is worth re-checking after any dependency
+change:
 
 ```sh
-x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/VoiceNotepad.exe | grep -i 'DLL Name'
+x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/VoiceNotepad.exe \
+  | grep -i 'DLL Name' | sort -u
 ```
+
+`onnxruntime.dll` deliberately does **not** appear there: it is loaded at
+runtime, not linked.
+
+## Sharing it, and Windows SmartScreen
+
+### What to send people
+
+`dist/VoiceNotepad-<version>-Setup.exe` **is a single file.** The ONNX Runtime
+DLL is packed inside it and only lands on disk at install time. Nothing else
+needs to go with it. The portable zip is the only two-file deliverable, and
+that is what the zip is for.
+
+### Signing
+
+`scripts/sign-windows.sh` Authenticode-signs a file with `osslsigncode`, from
+Linux. `build-installer.sh` calls it on the exe before packaging and on the
+installer afterwards, so both are signed. With no certificate configured it
+prints why it skipped and the build carries on, so this costs nothing until
+there is a certificate.
+
+```sh
+export VOICENOTEPAD_CERT=~/secrets/codesign.pfx   # outside the project
+export VOICENOTEPAD_CERT_PASS='...'               # environment only, never a file here
+./scripts/build-installer.sh
+```
+
+The signature is timestamped (`-ts`), which is what keeps already-released
+builds verifying after the certificate expires. Without a timestamp everything
+signed stops validating on the expiry date.
+
+`osslsigncode` is not installed on this box; the script finds it under
+`~/.local/share/voicenotepad-build/sign/` where it was unpacked without root,
+or `sudo apt install osslsigncode` to have it properly.
+
+### The single-exe experiment, and why it was not taken
+
+ONNX Runtime *does* have a prebuilt static library for the MSVC target, so the
+exe can be made genuinely self-contained. It was built and it works:
+`cargo-xwin` plus clang/lld unpacked into `~/.local/share/voicenotepad-build/llvm`,
+a `DirectML.lib` from the Microsoft.AI.DirectML NuGet package, and some
+case-variant symlinks in the xwin SDK because the Windows SDK is
+case-insensitive and Linux is not. The manifest still carries the
+`target_env = "msvc"` section that makes it possible.
+
+It was rejected because the resulting 35 MB exe imports `VCRUNTIME140.dll`
+and `MSVCP140.dll` -- the Visual C++ Redistributable. `-C
+target-feature=+crt-static` does not fix it: pyke's prebuilt ONNX Runtime is
+built against the dynamic CRT, so a static CRT fails to link with a wall of
+undefined `__declspec(dllimport)` symbols.
+
+So the choice was between one DLL we ship ourselves and a system prerequisite
+we cannot control, whose failure mode is a cryptic *VCRUNTIME140.dll was not
+found* on a machine that happens to lack it. The MinGW build wins. Revisit if
+ONNX Runtime ever ships a static-CRT build.
 
 ## Testing
 
-`cargo test --no-default-features` runs 89 tests of the pure logic - bullets,
-markdown, settings, resampling, voice detection, transcript scrubbing - with
+`cargo test --no-default-features` runs 88 tests of the pure logic - bullets,
+markdown, settings, model completeness, resampling, fragment joining - with
 no audio hardware and no GPU. That is what the `app` feature split is for: the
-modules needing cpal, eframe and whisper.cpp sit behind it, so the parts where
+modules needing cpal, eframe and the recogniser sit behind it, so the parts where
 the spec pins down behaviour stay testable anywhere.
 
-`cargo test --target x86_64-pc-windows-gnu` runs all 102 as actual Windows
+`cargo test --target x86_64-pc-windows-gnu` runs all 101 as actual Windows
 binaries under Wine, via the `runner = "wine"` line in `.cargo/config.toml`.
 This is worth doing before shipping; it is the only place the hotkey and theme
 modules get executed.
 
-`examples/transcribe-file.rs` runs a WAV through the real pipeline - the same
-voice detector, the same Whisper parameters, the same cleanup - and asserts
-the output has no timestamps or markers in it:
+`examples/transcribe-file.rs` runs a WAV through the real pipeline -- the same
+`Recogniser`, the same chunking, the same fragment joining -- reports the
+speed, and asserts the output has no timestamps or markers in it. This is how
+the numbers above were measured:
 
 ```sh
-cargo run --release --target x86_64-pc-windows-gnu --example transcribe-file -- \
-  model.bin audio.wav          # phrase at a time, as live dictation does
-cargo run ... -- model.bin audio.wav --whole   # one clip, as a baseline
+cargo run --release --example transcribe-file -- \
+  ~/.local/share/voicenotepad/models/nemotron-streaming-en clip.wav
 ```
 
 ### What was verified by hand
@@ -231,8 +279,12 @@ Under Wine, driving the real window with synthetic X11 input: typing; the
 Copy All producing exactly the specified markdown (copied, then pasted back
 into the document to read it); undo; the theme toggle; Settings via
 right-clicking the mic; the mic turning red with the status-bar dot; the model
-downloading on first run; whisper.cpp transcribing; and a clean
-install/run/uninstall cycle on a fresh Wine prefix.
+downloading on first run, with combined progress across its five files; and a
+clean install/run/uninstall cycle on a fresh Wine prefix with the ONNX
+Runtime DLL alongside.
+
+On Linux, additionally: real speech through a real microphone transcribed
+into the document, continuously and correctly spaced.
 
 Note that Wine needs a virtual desktop (`wine explorer /desktop=...`) for
 keyboard input to work on a bare Xvfb with no window manager. Without it the
@@ -240,6 +292,10 @@ window appears and the mouse works, but keystrokes go nowhere - which looks
 exactly like an application bug and is not one.
 
 ## Known limitations
+
+**Dictation itself is proven, on Linux.** Real speech through a real
+microphone was transcribed into the document continuously and correctly
+spaced. That had never been true before 2.0.
 
 **Not run on real Windows.** Everything above was verified under Wine 10 on
 Linux. Wine is a good proxy and the binary is a genuine PE that links only
@@ -257,39 +313,23 @@ pinned at 950% CPU. Worth re-measuring on Windows, and the way to tell whether
 any future regression is ours is to build a twenty-line blank eframe window
 and compare.
 
-**Accuracy depends on how you pause.** A phrase is committed after 900 ms of
-silence, and each phrase is transcribed on its own. Speaking in complete
-thoughts gives noticeably better text than trailing off mid-sentence, because
-a fragment has less context to work with. Measured on `jfk.wav` with
-`tiny.en`: the whole clip transcribes perfectly, while phrase-at-a-time turns
-"my fellow Americans" into "am I fellow Americans". Bigger models are more
-forgiving. Lengthening `HANGOVER_FRAMES` in `vad.rs` trades latency for
-accuracy, and costs less than it sounds like, because partials keep streaming
-regardless - only the final correction is delayed.
+**The model is 2.4 GB and holds about 2.55 GB of memory.** There is no
+quantised export of the streaming Nemotron model. The EOU model in Settings
+is a fifth of the size, at the cost of all punctuation and capitalisation.
 
-**Long unbroken phrases get expensive.** Every partial re-transcribes the whole
-phrase so far, so a 15-second sentence makes each partial cost 15 seconds of
-audio to decode. There is a hard commit at 15 s to bound this. A sliding
-window would be the fix, at the cost of complicating the replace-in-place
-logic that makes the text firm up smoothly.
+**It transcribes whatever it hears.** There is no voice detector in front of
+the recogniser any more -- the model handles silence itself -- so background
+speech, a video playing nearby or a noisy room will end up in the note. Press
+the hotkey to stop listening rather than leaving it on.
 
 **Find is plain substring search.** No regular expressions, no Find Previous,
 no Replace. Notepad's Find has more than this.
 
-**The voice detector is a level gate.** An adaptive noise floor with an onset
-count and a hangover. It handles a steady hiss well and is cheap, but a noisy
-room with sudden sounds - a door, a cough - can open a phrase. whisper.cpp
-ships a proper VAD model (`whisper-rs` exposes `set_vad_model_path`) which
-would be the upgrade if it becomes annoying.
-
-**Global hotkeys do not work under Wayland.** `global-hotkey` has only an X11
-backend, and a Wayland compositor will not deliver keystrokes to an X11 grab -
-the registration succeeds and then nothing ever fires. The app detects a
-Wayland session (`platform::hotkey_caveat`) and says so in the status bar and
-in Settings rather than leaving someone to work it out. An Xorg session is the
-fix. The other route, if it ever matters, is a small IPC socket plus a
-`--toggle` flag so a GNOME custom shortcut can drive it; that is noted in
-TASKS.md and not built.
+**Dictation is append-only.** A streaming recogniser emits text once and does
+not revise it, so there is no "in-progress phrase firming up in place" any
+more -- the original spec asked for that, but it was a way of making a batch
+model feel live, and a streaming model is simply live. Text appears as it is
+recognised and then stays put.
 
 **Linux: built and installed, but lightly exercised.** `scripts/install-linux.sh`
 puts it under `~/.local` with a desktop entry and icons. Verified on this box

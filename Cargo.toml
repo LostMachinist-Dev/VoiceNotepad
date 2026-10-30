@@ -1,9 +1,9 @@
 [package]
 name = "voice-notepad"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.82"
-description = "A Windows Notepad look-alike with local, offline speech-to-text"
+description = "A Notepad look-alike with local, offline streaming speech-to-text"
 authors = ["yerko42@gmail.com"]
 license = "MIT"
 
@@ -23,12 +23,13 @@ required-features = ["app"]
 default = ["app"]
 app = [
     "dep:arboard",
+    "dep:ort",
     "dep:cpal",
     "dep:eframe",
     "dep:egui",
     "dep:global-hotkey",
+    "dep:parakeet-rs",
     "dep:rfd",
-    "dep:whisper-rs",
 ]
 
 [dependencies]
@@ -53,24 +54,60 @@ eframe = { version = "0.37", default-features = false, optional = true, features
     "x11",
 ] }
 egui = { version = "0.37", optional = true }
-# Speech to text: whisper.cpp. CPU build - see HANDOFF.md for why.
-whisper-rs = { version = "0.16", default-features = false, optional = true }
 cpal = { version = "0.18", optional = true }
 arboard = { version = "3.7", optional = true }
 rfd = { version = "0.17", optional = true }
 global-hotkey = { version = "0.9", optional = true }
 
+# --- speech recognition: NVIDIA Parakeet, on ONNX Runtime ----------------
+# The two halves differ only in how ONNX Runtime is linked.
+#
+# Linux links it statically, so the binary stands alone.
+[target.'cfg(not(windows))'.dependencies]
+parakeet-rs = { version = "0.4", optional = true }
+
+# Windows, MSVC target: prebuilt *static* ONNX Runtime exists, so this links
+# it in and the exe is a single file with nothing beside it.
+#
+# `cpu` rather than the default feature set: the default drags in the
+# DirectML execution provider, which wants a DirectML.lib that is not in the
+# Windows SDK, and we run on the CPU anyway.
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+parakeet-rs = { version = "0.4", optional = true, default-features = false, features = [
+    "cpu",
+    "api-28",
+] }
+# Depended on directly so the linking strategy can be chosen here: cargo
+# unifies these features with parakeet-rs's own minimal ort dependency.
+# `download-binaries` is what fetches and statically links ONNX Runtime.
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    # The download happens at build time, on the build machine. rustls keeps
+    # that from needing OpenSSL development packages installed.
+    "tls-rustls",
+    "api-28",
+] }
+
+# Windows, MinGW target: no static ONNX Runtime exists for it -- Microsoft
+# publishes no MinGW build at all -- so this loads onnxruntime.dll at runtime
+# and the DLL has to travel with the exe. Kept as a fallback toolchain.
+[target.'cfg(all(windows, target_env = "gnu"))'.dependencies]
+parakeet-rs = { version = "0.4", optional = true, default-features = false, features = [
+    "load-dynamic",
+    "api-28",
+] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
-
-[patch.crates-io]
-# Patched for *-windows-gnu cross-compilation; run scripts/vendor-whisper-sys.py
-# to create it. See HANDOFF.md -> "The whisper-rs-sys patch".
-whisper-rs-sys = { path = "third_party/whisper-rs-sys-0.15.0" }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Deliberately NOT "abort". A panic in the audio callback thread used to take
+# the whole window down with no message at all; unwinding leaves the app alive
+# and the panic hook writes a log that says what happened.
+panic = "unwind"
 strip = true

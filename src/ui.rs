@@ -16,7 +16,7 @@ use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{Align, Key, Layout, Modifiers, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::config::{Config, HotkeySpec, ModelSize, ThemePref};
+use crate::config::{Config, HotkeySpec, SpeechModel, ThemePref};
 use crate::document::{self, LineEnding};
 use crate::hotkeys::{self, Hotkeys};
 use crate::markdown;
@@ -42,31 +42,14 @@ struct Snapshot {
     cursor: usize,
 }
 
-/// The transcription currently firming up on screen.
-///
-/// `written` is what we last put in the document, so we can confirm the span
-/// is still ours before replacing it. If the user types over it, we let go
-/// rather than corrupting their edit.
-struct PartialSpan {
-    start: usize,
-    separator: String,
-    written: String,
-}
-
-impl PartialSpan {
-    fn len(&self) -> usize {
-        self.separator.chars().count() + self.written.chars().count()
-    }
-
-    fn full(&self) -> String {
-        format!("{}{}", self.separator, self.written)
-    }
-}
-
 /// Where the model is up to.
 enum ModelStatus {
     Idle,
-    Downloading { received: u64, total: Option<u64> },
+    Downloading {
+        received: u64,
+        total: Option<u64>,
+        file: String,
+    },
     Loading,
     Ready,
     Failed(String),
@@ -115,10 +98,13 @@ pub struct VoiceNotepad {
 
     listening: bool,
     model_status: ModelStatus,
-    partial: Option<PartialSpan>,
+    /// When dictated text was last appended, so a run of it collapses into
+    /// one undo step rather than one per chunk.
+    last_dictation: Option<Instant>,
     input_level: f32,
 
     show_settings: bool,
+    show_about: bool,
     show_find: bool,
     find_query: String,
     find_match_case: bool,
@@ -126,6 +112,11 @@ pub struct VoiceNotepad {
     capture_hotkey: Option<HotkeyField>,
     hotkey_draft: (String, String),
     devices: Vec<String>,
+    /// Result of Settings > Test microphone, filled in by a worker thread.
+    /// On Windows there is no console to print a diagnostic to, so it has to
+    /// be somewhere the user can actually see it.
+    mic_report: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    mic_test_running: bool,
     draft: Config,
 
     /// Why the hotkeys may not reach us here, if the platform can tell.
@@ -145,12 +136,16 @@ impl VoiceNotepad {
         let appearance = theme::resolve(config.theme);
         theme::apply(&cc.egui_ctx, appearance);
 
-        let engine = SpeechEngine::spawn(config.model, config.input_device.clone());
+        let engine = SpeechEngine::spawn(
+            config.model,
+            config.input_device.clone(),
+            cc.egui_ctx.clone(),
+        );
         // Get the model on disk straight away, so the progress bar appears on
         // first run rather than the first time the mic button is pressed.
         engine.send(Command::EnsureModel);
 
-        let mut hotkeys = Hotkeys::new();
+        let mut hotkeys = Hotkeys::new(cc.egui_ctx.clone());
         hotkeys.apply(&config.toggle_spec(), &config.bullet_spec());
         // Either the registration failed, or it succeeded somewhere the keys
         // will never arrive from. Both are worth saying out loud.
@@ -184,15 +179,18 @@ impl VoiceNotepad {
             last_user_edit: None,
             listening: false,
             model_status: ModelStatus::Idle,
-            partial: None,
+            last_dictation: None,
             input_level: 0.0,
             show_settings: false,
+            show_about: false,
             show_find: false,
             find_query: String::new(),
             find_match_case: false,
             find_message: None,
             capture_hotkey: None,
             devices,
+            mic_report: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            mic_test_running: false,
             hotkey_caveat,
             message: hotkey_warning.clone().map(|w| (w, Instant::now())),
             last_title: String::new(),
@@ -283,7 +281,7 @@ impl VoiceNotepad {
         self.line_ending = LineEnding::default();
         self.undo.clear();
         self.redo.clear();
-        self.partial = None;
+        self.last_dictation = None;
         self.set_cursor(0);
         self.note("New note");
     }
@@ -321,7 +319,7 @@ impl VoiceNotepad {
                 self.dirty = false;
                 self.undo.clear();
                 self.redo.clear();
-                self.partial = None;
+                self.last_dictation = None;
                 self.set_cursor(0);
                 self.note(format!("Opened {}", self.file_label()));
             }
@@ -482,7 +480,7 @@ impl VoiceNotepad {
         self.text = previous.text;
         self.set_cursor(previous.cursor.min(self.text.chars().count()));
         self.dirty = true;
-        self.partial = None;
+        self.last_dictation = None;
     }
 
     fn do_redo(&mut self) {
@@ -496,7 +494,7 @@ impl VoiceNotepad {
         self.text = next.text;
         self.set_cursor(next.cursor.min(self.text.chars().count()));
         self.dirty = true;
-        self.partial = None;
+        self.last_dictation = None;
     }
 
     /// Record an undo step for text the user typed, coalescing a run of
@@ -519,8 +517,8 @@ impl VoiceNotepad {
         }
         self.last_user_edit = Some(now);
         self.dirty = true;
-        // Typing invalidates any partial we were holding.
-        self.partial = None;
+        // Typing interrupts dictation, so the next burst starts a new step.
+        self.last_dictation = None;
     }
 
     // --- speech ------------------------------------------------------------
@@ -536,106 +534,37 @@ impl VoiceNotepad {
     fn new_bullet(&mut self) {
         let (text, cursor) = document::insert_new_bullet(&self.text, self.cursor);
         self.edit(text, cursor);
-        // The next phrase starts inside the new bullet.
-        self.partial = None;
+        // Dictation that follows belongs to a new undo step.
+        self.last_dictation = None;
     }
 
-    /// Put the in-progress phrase on screen, replacing the previous guess.
-    fn show_partial(&mut self, phrase: &str) {
-        if phrase.trim().is_empty() {
+    /// Append recognised text at the cursor.
+    ///
+    /// A streaming recogniser emits text once and never revises it, so there
+    /// is nothing to hold open and replace: each piece simply goes in where
+    /// the cursor is. The old engine needed a whole mechanism for swapping an
+    /// in-progress phrase in place; this is what is left of it.
+    fn append_dictation(&mut self, text: &str) {
+        let insertion = transcript::join_fragment(self.char_before(self.cursor), text);
+        if insertion.is_empty() {
             return;
         }
 
-        // If the span we wrote is no longer intact -- the user typed over it,
-        // or undid it -- forget it and start a new one at the cursor.
-        if let Some(span) = &self.partial {
-            let here = self.slice_chars(span.start, span.start + span.len());
-            if here != span.full() {
-                self.partial = None;
-            }
+        // One undo step per burst of speech, not per chunk of audio.
+        let now = Instant::now();
+        let fresh = self
+            .last_dictation
+            .map(|t| now.duration_since(t) > UNDO_COALESCE)
+            .unwrap_or(true);
+        if fresh {
+            self.snapshot();
         }
+        self.last_dictation = Some(now);
 
-        match self.partial.take() {
-            Some(span) => {
-                let separator = span.separator.clone();
-                let replacement = format!("{separator}{phrase}");
-                let (text, cursor) = document::replace_range(
-                    &self.text,
-                    span.start..span.start + span.len(),
-                    &replacement,
-                );
-                self.text = text;
-                self.set_cursor(cursor);
-                self.partial = Some(PartialSpan {
-                    start: span.start,
-                    separator,
-                    written: phrase.to_string(),
-                });
-            }
-            None => {
-                let start = self.cursor;
-                let separator =
-                    if transcript::phrase_with_separator(self.char_before(start), phrase)
-                        .starts_with(' ')
-                    {
-                        " ".to_string()
-                    } else {
-                        String::new()
-                    };
-                let insertion = format!("{separator}{phrase}");
-                let (text, cursor) = document::insert_at(&self.text, start, &insertion);
-                // A new phrase is one undo step; the refinements that follow
-                // are not, or every partial would fill the undo stack.
-                self.snapshot();
-                self.text = text;
-                self.set_cursor(cursor);
-                self.partial = Some(PartialSpan {
-                    start,
-                    separator,
-                    written: phrase.to_string(),
-                });
-            }
-        }
+        let (text, cursor) = document::insert_at(&self.text, self.cursor, &insertion);
+        self.text = text;
+        self.set_cursor(cursor);
         self.dirty = true;
-    }
-
-    /// Commit the phrase: the text stops moving.
-    fn commit_phrase(&mut self, phrase: &str) {
-        let phrase = phrase.trim();
-
-        if let Some(span) = &self.partial {
-            let here = self.slice_chars(span.start, span.start + span.len());
-            if here != span.full() {
-                self.partial = None;
-            }
-        }
-
-        match self.partial.take() {
-            Some(span) => {
-                let replacement = if phrase.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}{}", span.separator, phrase)
-                };
-                let (text, cursor) = document::replace_range(
-                    &self.text,
-                    span.start..span.start + span.len(),
-                    &replacement,
-                );
-                self.text = text;
-                self.set_cursor(cursor);
-                self.dirty = true;
-            }
-            None => {
-                if phrase.is_empty() {
-                    return;
-                }
-                let insertion =
-                    transcript::phrase_with_separator(self.char_before(self.cursor), phrase);
-                let (text, cursor) = document::insert_at(&self.text, self.cursor, &insertion);
-                self.edit(text, cursor);
-            }
-        }
     }
 
     fn handle_engine_events(&mut self) {
@@ -646,10 +575,19 @@ impl VoiceNotepad {
                         self.model_status = ModelStatus::Downloading {
                             received: 0,
                             total: None,
+                            file: "working out the size".into(),
                         }
                     }
-                    model::Progress::Downloading { received, total } => {
-                        self.model_status = ModelStatus::Downloading { received, total }
+                    model::Progress::Downloading {
+                        received,
+                        total,
+                        file,
+                    } => {
+                        self.model_status = ModelStatus::Downloading {
+                            received,
+                            total,
+                            file,
+                        }
                     }
                     model::Progress::Done(_) => {
                         let was_downloading =
@@ -671,8 +609,7 @@ impl VoiceNotepad {
                         self.input_level = 0.0;
                     }
                 }
-                Event::Partial(text) => self.show_partial(&text),
-                Event::Final(text) => self.commit_phrase(&text),
+                Event::Text(text) => self.append_dictation(&text),
                 Event::Level(level) => self.input_level = level,
                 Event::Error(message) => self.error = Some(message),
             }
@@ -983,6 +920,8 @@ impl eframe::App for VoiceNotepad {
         self.editor(ui, &palette, cursor_at_frame_start);
 
         self.settings_window(ctx);
+        self.mic_report_window(ctx);
+        self.about_window(ctx);
         self.find_window(ctx);
         self.model_window(ctx);
         self.error_window(ctx);
@@ -1031,6 +970,7 @@ impl VoiceNotepad {
                     self.file_menu(ui);
                     self.edit_menu(ui, ctx);
                     self.view_menu(ui);
+                    self.help_menu(ui);
 
                     // Theme toggle and mic button, at the right end.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1183,6 +1123,112 @@ impl VoiceNotepad {
         });
     }
 
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        egui::menu::MenuButton::new("Help").ui(ui, |ui| {
+            if menu_item(ui, "About Voice Notepad", "") {
+                self.show_about = true;
+            }
+        });
+    }
+
+    /// Everything someone would be asked for in a bug report, in one place
+    /// and copyable in one click.
+    fn about_details(&self) -> String {
+        let model = self.config.model;
+        let model_state = match crate::config::find_model(model) {
+            Some(path) => format!("{} ({})", model.label(), path.display()),
+            None => format!("{} (not downloaded yet)", model.label()),
+        };
+        let mut details = format!(
+            "{}\nspeech model: {}\nmicrophone: {}\ntheme: {}\nhotkeys: {} / {}\n",
+            crate::diagnostics::version_line(),
+            model_state,
+            self.config
+                .input_device
+                .clone()
+                .unwrap_or_else(|| "system default".into()),
+            self.config.theme.label(),
+            self.config.toggle_hotkey,
+            self.config.bullet_hotkey,
+        );
+        if let Some(path) = crate::config::config_file() {
+            details.push_str(&format!("settings: {}\n", path.display()));
+        }
+        if let Some(path) = crate::config::log_file() {
+            details.push_str(&format!("log: {}\n", path.display()));
+        }
+        if let Some(caveat) = &self.hotkey_caveat {
+            details.push_str(&format!("note: {}\n", caveat.detail));
+        }
+        details
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        let details = self.about_details();
+
+        egui::Window::new("About Voice Notepad")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Voice Notepad")
+                        .heading()
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        .size(14.0),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    "A Notepad look-alike that types what you say. The speech \
+                     recognition runs on this computer; nothing is sent anywhere.",
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(170.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(details.clone())
+                                .monospace()
+                                .size(11.0),
+                        );
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Copy details")
+                        .on_hover_text("For a bug report")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(details.clone());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if close || !open {
+            self.show_about = false;
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         egui::Panel::bottom("status")
             .frame(
@@ -1309,19 +1355,24 @@ impl VoiceNotepad {
                         self.draft.model.approx_size()
                     ))
                     .show_ui(ui, |ui| {
-                        for size in ModelSize::ALL {
+                        for model in SpeechModel::ALL {
                             ui.selectable_value(
                                 &mut self.draft.model,
-                                size,
+                                model,
                                 format!(
                                     "{} - {}, {}",
-                                    size.label(),
-                                    size.hint(),
-                                    size.approx_size()
+                                    model.label(),
+                                    model.hint(),
+                                    model.approx_size()
                                 ),
                             );
                         }
                     });
+                if self.draft.model == SpeechModel::Eou {
+                    ui.small(
+                        "This model writes no punctuation and no capital letters.",
+                    );
+                }
                 if self.draft.model != self.config.model {
                     ui.small("This model will be downloaded when you press Save.");
                 }
@@ -1352,6 +1403,24 @@ impl VoiceNotepad {
                 if self.devices.is_empty() {
                     ui.small("No microphones were found.");
                 }
+                ui.horizontal(|ui| {
+                    let busy = self.mic_test_running;
+                    let enabled = !busy && !self.listening;
+                    let button = ui.add_enabled(
+                        enabled,
+                        egui::Button::new(if busy {
+                            "Testing..."
+                        } else {
+                            "Test microphone"
+                        })
+                        .small(),
+                    );
+                    if self.listening {
+                        button.on_hover_text("Stop listening first");
+                    } else if button.clicked() {
+                        self.start_mic_test(ui.ctx().clone());
+                    }
+                });
                 if self.listening {
                     ui.add(
                         egui::ProgressBar::new((self.input_level * 6.0).min(1.0))
@@ -1365,6 +1434,22 @@ impl VoiceNotepad {
                 ui.small("These work even when another program has focus.");
                 self.hotkey_row(ui, HotkeyField::Toggle, "Start/stop listening");
                 self.hotkey_row(ui, HotkeyField::Bullet, "New bullet");
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // A mis-click while rebinding otherwise leaves no way
+                        // back except editing the settings file by hand.
+                        if ui
+                            .small_button("Reset to defaults")
+                            .on_hover_text("Ctrl+Alt+Space and Ctrl+Alt+B")
+                            .clicked()
+                        {
+                            let defaults = Config::default();
+                            self.hotkey_draft =
+                                (defaults.toggle_hotkey, defaults.bullet_hotkey);
+                            self.capture_hotkey = None;
+                        }
+                    });
+                });
                 if !self.hotkeys.available() {
                     ui.small("System-wide hotkeys are unavailable in this session.");
                 }
@@ -1429,6 +1514,70 @@ impl VoiceNotepad {
                     }
                     self.capture_hotkey = None;
                 }
+            }
+        }
+    }
+
+    /// Open the chosen microphone for a few seconds and report what happened.
+    /// Runs off the UI thread, because it deliberately sits and listens.
+    fn start_mic_test(&mut self, ctx: egui::Context) {
+        self.mic_test_running = true;
+        if let Ok(mut slot) = self.mic_report.lock() {
+            *slot = None;
+        }
+        let device = self.draft.input_device.clone();
+        let slot = std::sync::Arc::clone(&self.mic_report);
+        std::thread::Builder::new()
+            .name("voice-notepad-mic-test".into())
+            .spawn(move || {
+                let report = crate::audio::check(
+                    device.as_deref(),
+                    std::time::Duration::from_secs(3),
+                );
+                crate::diagnostics::append(&format!("---\n{report}"));
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = Some(report);
+                }
+                ctx.request_repaint();
+            })
+            .ok();
+    }
+
+    fn mic_report_window(&mut self, ctx: &egui::Context) {
+        let report = match self.mic_report.lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => None,
+        };
+        let Some(report) = report else { return };
+        self.mic_test_running = false;
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Microphone test")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new(report.clone()).monospace().size(11.0));
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(report.clone());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if close || !open {
+            if let Ok(mut slot) = self.mic_report.lock() {
+                *slot = None;
             }
         }
     }
@@ -1501,8 +1650,12 @@ impl VoiceNotepad {
     }
 
     fn model_window(&mut self, ctx: &egui::Context) {
-        let (received, total) = match self.model_status {
-            ModelStatus::Downloading { received, total } => (received, total),
+        let (received, total, file) = match &self.model_status {
+            ModelStatus::Downloading {
+                received,
+                total,
+                file,
+            } => (*received, *total, file.clone()),
             ModelStatus::Loading => {
                 egui::Window::new("Preparing speech")
                     .collapsible(false)
@@ -1526,12 +1679,17 @@ impl VoiceNotepad {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "Getting the {} model. This happens once; after that \
+                    "Getting the {} model ({}). This happens once; after that \
                      everything runs offline on this computer.",
-                    self.config.model.label()
+                    self.config.model.label(),
+                    self.config.model.approx_size()
                 ));
                 ui.add_space(6.0);
-                let progress = model::Progress::Downloading { received, total };
+                let progress = model::Progress::Downloading {
+                    received,
+                    total,
+                    file: file.clone(),
+                };
                 match progress.fraction() {
                     Some(fraction) => {
                         ui.add(
@@ -1553,6 +1711,8 @@ impl VoiceNotepad {
                     ),
                     None => model::format_bytes(received),
                 });
+                ui.add_space(2.0);
+                ui.small(format!("file: {file}"));
                 ui.add_space(4.0);
                 ui.small("You can keep typing while this finishes.");
             });

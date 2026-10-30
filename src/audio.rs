@@ -94,6 +94,86 @@ pub fn default_input_device_name() -> Option<String> {
         .map(|d| d.to_string())
 }
 
+/// Open the default input briefly and report what happened, in words.
+///
+/// Exists because "I pressed the mic and nothing happened" is otherwise
+/// impossible to act on: this says whether a device opens, at what rate and
+/// format, and whether any sound actually arrives.
+pub fn check(preferred: Option<&str>, listen_for: std::time::Duration) -> String {
+    let devices = list_input_devices();
+    let default = default_input_device_name();
+    let requested = preferred.unwrap_or("system default").to_string();
+
+    // Detail is gathered first but printed after the verdict: the answer to
+    // "is my microphone working" should not be below the fold.
+    let mut detail = String::new();
+    detail.push_str(&format!("requested: {requested}\n"));
+    detail.push_str(&format!(
+        "system default: {}\n",
+        default.unwrap_or_else(|| "none".into())
+    ));
+
+    if devices.is_empty() {
+        return format!(
+            "NOT WORKING: no input devices were found at all.\n\n\
+             Plug a microphone in, then try again.\n\n{detail}"
+        );
+    }
+
+    let sink = shared_audio();
+    let capture = match start(preferred, Arc::clone(&sink)) {
+        Ok(capture) => capture,
+        Err(err) => {
+            return format!(
+                "NOT WORKING: the microphone would not open.\n\n{}\n\n{detail}\n{}",
+                err.user_message(),
+                device_list(&devices)
+            )
+        }
+    };
+    detail.push_str(&format!(
+        "opened: \"{}\" at {} Hz\n",
+        capture.device_name, capture.source_rate
+    ));
+
+    std::thread::sleep(listen_for);
+    let (count, peak) = match sink.lock() {
+        Ok(queue) => (
+            queue.len(),
+            queue.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+        ),
+        Err(_) => (0, 0.0),
+    };
+    drop(capture);
+
+    let seconds = count as f32 / crate::resample::WHISPER_SAMPLE_RATE as f32;
+    detail.push_str(&format!(
+        "received: {count} samples ({seconds:.2}s of 16 kHz mono)\n"
+    ));
+    detail.push_str(&format!("loudest sound: {peak:.4}\n"));
+
+    let verdict = if count == 0 {
+        "NOT WORKING: the microphone opened but sent no sound at all.\n\n         Something else has probably taken it, or it is disabled in the          system's sound settings."
+    } else if peak < 0.001 {
+        "NOT WORKING: sound is arriving, but it is completely silent.\n\n         The input is muted, or the wrong device is selected. Try picking a          specific microphone above instead of the system default."
+    } else if peak < 0.02 {
+        "WORKING, BUT VERY QUIET.\n\n         Sound is getting through but it is faint. Turn the input volume up          in the system's sound settings, or move closer to the microphone,          or speech may not be picked up."
+    } else {
+        "WORKING. Sound is reaching Voice Notepad."
+    };
+
+    format!("{verdict}\n\n{detail}\n{}", device_list(&devices))
+}
+
+/// The device list, last, because it is long and rarely the answer.
+fn device_list(devices: &[String]) -> String {
+    let mut out = format!("all {} input device(s) seen:\n", devices.len());
+    for name in devices {
+        out.push_str(&format!("  - {name}\n"));
+    }
+    out
+}
+
 /// A live capture. Dropping it stops the stream and the callback.
 pub struct Capture {
     // Held only to keep the stream alive; cpal stops it on drop.

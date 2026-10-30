@@ -1,16 +1,9 @@
 //! Tidying what Whisper returns before it reaches the document.
 //!
 //! The spec is strict about this: no timestamps, no speaker labels, no segment
-//! markers, anywhere. Whisper will happily emit `[BLANK_AUDIO]`, `(music)` and
-//! -- if asked, or if a stray flag changes -- bracketed time ranges. Rather
-//! than rely only on getting every parameter right, the text is scrubbed here
-//! too, so nothing of that shape can reach the note.
-
-use crate::resample::WHISPER_SAMPLE_RATE;
-
-/// Whisper is unreliable on very short clips, so anything shorter than this is
-/// padded with silence. 1.1 s leaves comfortable margin over the 1 s minimum.
-const MIN_INFERENCE_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * 11 / 10;
+//! markers, anywhere. ASR models emit annotations like `[BLANK_AUDIO]` or
+//! `(music)` given half a chance, so the text is scrubbed on the way out and
+//! nothing of that shape can reach the note.
 
 /// Words that, alone in parentheses, are Whisper describing a sound rather
 /// than transcribing speech.
@@ -37,23 +30,60 @@ const NON_SPEECH_WORDS: [&str; 20] = [
     "typing",
 ];
 
-/// Clean one piece of transcribed text.
+/// Clean one piece of transcribed text, collapsing all whitespace.
 ///
-/// Drops anything in square brackets outright -- Whisper uses them only for
-/// annotations -- drops parenthesised non-speech noises, and collapses
-/// whitespace. Ordinary parenthetical speech is left alone.
+/// For text that arrives as a complete utterance. Streaming fragments must
+/// use [`join_fragment`] instead, which preserves the spacing that tells
+/// words apart from the middles of words.
 pub fn clean_transcript(raw: &str) -> String {
-    let no_brackets = strip_spans(raw, '[', ']', |_| true);
-    let no_parens = strip_spans(&no_brackets, '(', ')', is_non_speech);
-
-    let mut out = String::with_capacity(no_parens.len());
-    for word in no_parens.split_whitespace() {
+    let stripped = strip_annotations(raw);
+    let mut out = String::with_capacity(stripped.len());
+    for word in stripped.split_whitespace() {
         if !out.is_empty() {
             out.push(' ');
         }
         out.push_str(word);
     }
     out
+}
+
+/// Strip annotations but keep the spacing exactly as the model emitted it.
+fn strip_annotations(raw: &str) -> String {
+    let no_brackets = strip_spans(raw, '[', ']', |_| true);
+    strip_spans(&no_brackets, '(', ')', is_non_speech)
+}
+
+/// Work out what to insert for one streaming fragment.
+///
+/// A streaming recogniser emits sub-word pieces, and the leading space on a
+/// piece is the only thing distinguishing the start of a new word from the
+/// middle of the current one: "polit" + "ical" is one word, "that" + " is"
+/// is two. Trimming each piece and re-joining them with spaces -- which is
+/// what the old whole-utterance logic did -- produced "polit ical" and
+/// "fun ctions".
+///
+/// So the model's own spacing is kept, with one exception: at the start of a
+/// line, or straight after a bullet marker, a leading space would show up as
+/// an indent, so it is dropped.
+pub fn join_fragment(preceding: Option<char>, fragment: &str) -> String {
+    // Newlines and tabs from the model would break the document's own
+    // structure, so they become ordinary spaces.
+    let cleaned: String = strip_annotations(fragment)
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+
+    if cleaned.trim().is_empty() {
+        return String::new();
+    }
+    match preceding {
+        // Start of the document, start of a line, or just after a bullet
+        // marker: a leading space would read as an indent.
+        None => cleaned.trim_start().to_string(),
+        Some(c) if c.is_whitespace() => cleaned.trim_start().to_string(),
+        // Mid-line: whatever spacing the model chose is the right spacing.
+        Some(_) => cleaned,
+    }
 }
 
 /// Remove `open`..`close` spans for which `discard` returns true.
@@ -94,39 +124,6 @@ fn is_non_speech(inner: &str) -> bool {
             .to_ascii_lowercase();
         NON_SPEECH_WORDS.contains(&w.as_str())
     })
-}
-
-/// Pad a short clip with silence so Whisper will accept it.
-///
-/// Returns a borrow when no padding is needed, so the common case copies
-/// nothing.
-pub fn pad_for_inference(samples: &[f32]) -> std::borrow::Cow<'_, [f32]> {
-    if samples.len() >= MIN_INFERENCE_SAMPLES {
-        return std::borrow::Cow::Borrowed(samples);
-    }
-    let mut padded = Vec::with_capacity(MIN_INFERENCE_SAMPLES);
-    padded.extend_from_slice(samples);
-    padded.resize(MIN_INFERENCE_SAMPLES, 0.0);
-    std::borrow::Cow::Owned(padded)
-}
-
-/// Join a committed phrase onto what is already in the note.
-///
-/// Inserts a single separating space when the preceding character needs one,
-/// so successive phrases read as prose rather than running together. Returns
-/// the text to insert, which may be empty.
-pub fn phrase_with_separator(preceding: Option<char>, phrase: &str) -> String {
-    let phrase = phrase.trim();
-    if phrase.is_empty() {
-        return String::new();
-    }
-    match preceding {
-        // Start of the document, start of a line, or just after a bullet
-        // marker: no separator wanted.
-        None => phrase.to_string(),
-        Some(c) if c.is_whitespace() => phrase.to_string(),
-        Some(_) => format!(" {phrase}"),
-    }
 }
 
 #[cfg(test)]
@@ -202,50 +199,57 @@ mod tests {
         );
     }
 
-    // --- padding -----------------------------------------------------------
+    // --- joining streaming fragments ---------------------------------------
 
     #[test]
-    fn short_clips_are_padded_to_the_whisper_minimum() {
-        let short = vec![0.1f32; 100];
-        let padded = pad_for_inference(&short);
-        assert_eq!(padded.len(), MIN_INFERENCE_SAMPLES);
-        assert_eq!(padded[0], 0.1);
-        assert_eq!(padded[MIN_INFERENCE_SAMPLES - 1], 0.0);
+    fn a_fragment_continuing_a_word_gets_no_space() {
+        // This is the bug that produced "polit ical" and "fun ctions".
+        assert_eq!(join_fragment(Some('t'), "ical"), "ical");
+        assert_eq!(join_fragment(Some('n'), "ctions"), "ctions");
     }
 
     #[test]
-    fn long_clips_are_passed_through_without_copying() {
-        let long = vec![0.1f32; MIN_INFERENCE_SAMPLES * 2];
-        let out = pad_for_inference(&long);
-        assert_eq!(out.len(), long.len());
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    fn the_models_own_leading_space_starts_a_new_word() {
+        assert_eq!(join_fragment(Some('t'), " is"), " is");
+        assert_eq!(join_fragment(Some('.'), " That"), " That");
     }
 
     #[test]
-    fn an_empty_clip_pads_to_silence() {
-        let out = pad_for_inference(&[]);
-        assert_eq!(out.len(), MIN_INFERENCE_SAMPLES);
-        assert!(out.iter().all(|s| *s == 0.0));
-    }
-
-    // --- joining phrases ---------------------------------------------------
-
-    #[test]
-    fn a_phrase_after_a_word_gets_one_space() {
-        assert_eq!(phrase_with_separator(Some('.'), "Next thought"), " Next thought");
-        assert_eq!(phrase_with_separator(Some('d'), "and then"), " and then");
+    fn a_leading_space_is_dropped_at_the_start_of_a_line() {
+        assert_eq!(join_fragment(None, " First"), "First");
+        assert_eq!(join_fragment(Some('\n'), " First"), "First");
+        // Straight after a bullet marker, which ends in a space.
+        assert_eq!(join_fragment(Some(' '), " First"), "First");
     }
 
     #[test]
-    fn a_phrase_after_whitespace_or_at_the_start_gets_none() {
-        assert_eq!(phrase_with_separator(None, "First"), "First");
-        assert_eq!(phrase_with_separator(Some(' '), "First"), "First");
-        assert_eq!(phrase_with_separator(Some('\n'), "First"), "First");
+    fn whitespace_only_fragments_insert_nothing() {
+        assert_eq!(join_fragment(Some('a'), " "), "");
+        assert_eq!(join_fragment(Some('a'), ""), "");
     }
 
     #[test]
-    fn an_empty_phrase_inserts_nothing() {
-        assert_eq!(phrase_with_separator(Some('.'), "   "), "");
-        assert_eq!(phrase_with_separator(None, ""), "");
+    fn newlines_from_the_model_become_spaces() {
+        // A stray newline would break the document's bullet structure.
+        assert_eq!(join_fragment(Some('a'), "\nnext"), " next");
+        assert!(!join_fragment(Some('a'), "one\ntwo").contains('\n'));
+    }
+
+    #[test]
+    fn annotations_are_stripped_from_fragments_too() {
+        assert_eq!(join_fragment(Some('a'), " [BLANK_AUDIO]"), "");
+        assert_eq!(join_fragment(Some('a'), " word (music)"), " word ");
+    }
+
+    #[test]
+    fn rebuilding_a_sentence_from_fragments_reads_correctly() {
+        // Exactly the shape the recogniser emits.
+        let fragments = ["A", " polit", "ical", " star", " is", " more", " reluct", "ant", "."];
+        let mut out = String::new();
+        for fragment in fragments {
+            let piece = join_fragment(out.chars().last(), fragment);
+            out.push_str(&piece);
+        }
+        assert_eq!(out, "A political star is more reluctant.");
     }
 }
