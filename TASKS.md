@@ -53,6 +53,24 @@
 - The app detects a Wayland session and explains that the hotkeys cannot be
   delivered there, rather than failing silently.
 
+## Done in this round
+- Fixed switching models mid-dictation. The microphone stayed open with no
+  recogniser behind it, so the button stayed red, audio piled up unconsumed
+  and no text ever arrived. Four tests cover it.
+- The new-bullet hotkey default is now `Ctrl+\``. Note this only applies to
+  new settings files; an existing one keeps what it had until Reset to
+  defaults.
+- Windows version info is generated from the crate version. It had drifted to
+  1.2.0 on a 2.0.0 build.
+- `cargo test --no-default-features` builds again; the example needed
+  `required-features`.
+- `scripts/package-release.sh` builds the installer, the portable zip and a
+  Linux tarball, with SHA256SUMS, in one command.
+- Repo prepared to be public: personal email removed, study guide generator
+  untracked (it holds a LAN address), .gitignore hardened, README rewritten
+  with a real screenshot, a bug report template added. History squashed to
+  five commits authored as lostmachinist.
+
 ## Next
 - Use it in anger on both machines. Everything about the new engine has been
   proven on this box, including real speech through a real microphone, but
@@ -72,5 +90,6 @@
   noisy room.
 
 ## Blocked
-- Native Linux build needs `sudo apt install libasound2-dev` (ALSA headers for
-  cpal). Nothing else is in the way; Windows is unaffected.
+- Creating the public GitHub repo. The sandbox refused the publish step, so
+  the repo has to be created by hand; everything else is ready and the
+  release artifacts are built in dist/.
