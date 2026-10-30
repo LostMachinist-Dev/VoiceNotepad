@@ -297,11 +297,12 @@ exactly like an application bug and is not one.
 microphone was transcribed into the document continuously and correctly
 spaced. That had never been true before 2.0.
 
-**Not run on real Windows.** Everything above was verified under Wine 10 on
-Linux. Wine is a good proxy and the binary is a genuine PE that links only
-system DLLs, but it is a proxy. The things most worth a second look on real
-hardware are microphone enumeration and permissions, and whether
-`RegisterHotKey` collides with anything already installed.
+**Run on real Windows by the author**, with a real microphone, and reported
+working. That is the project's actual test path and it does not pass through
+this box, so nothing in this repo records it. Everything written here as
+"verified" was verified under Wine 10 on Linux unless it says otherwise: Wine
+is a good proxy and the binary is a genuine PE linking only system DLLs, but
+the two sources of evidence are different and worth keeping apart.
 
 **Idle CPU could not be measured here.** Under Wine on Xvfb the app sits at
 about half a core when idle - but so does a completely blank eframe window
@@ -309,9 +310,9 @@ built the same way, which is how I know it is the environment's software-GL
 message pump rather than this app. The one real bug in this area is fixed: the
 window title was being sent as a viewport command every frame, which marked
 the viewport dirty, which requested another repaint, forever; that had it
-pinned at 950% CPU. Worth re-measuring on Windows, and the way to tell whether
-any future regression is ours is to build a twenty-line blank eframe window
-and compare.
+pinned at 950% CPU. Not measured on real Windows with a number attached; the
+way to tell whether any future regression is ours is to build a twenty-line
+blank eframe window and compare against it.
 
 **The model is 2.4 GB and holds about 2.55 GB of memory.** There is no
 quantised export of the streaming Nemotron model. The EOU model in Settings

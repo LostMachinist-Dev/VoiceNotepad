@@ -72,16 +72,11 @@
   five commits authored as lostmachinist.
 
 ## Next
-- Use it in anger on both machines. Everything about the new engine has been
-  proven on this box, including real speech through a real microphone, but
-  not on the Windows laptop.
 - Measure whether the Nemotron model keeps up on the laptop. If not, the EOU
   model in Settings is the answer, at the cost of punctuation.
-- Run it on real Windows. Microphone enumeration, permissions, and whether
-  `RegisterHotKey` collides with anything already installed are the parts a
-  Wine test cannot really answer.
-- Measure idle CPU there too; it cannot be measured under Wine (HANDOFF.md
-  explains how to tell a real regression from the environment's noise).
+- Put a number on idle CPU on Windows. It cannot be measured under Wine
+  (HANDOFF.md explains how to tell a real regression from the environment's
+  noise).
 - Find Previous, Replace, and case-insensitive search beyond ASCII.
 - A way to toggle listening from outside the app on Wayland - a small IPC
   socket and a `--toggle` flag would let a GNOME custom shortcut do it, which
