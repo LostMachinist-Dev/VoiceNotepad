@@ -85,6 +85,11 @@
   noisy room.
 
 ## Blocked
-- Creating the public GitHub repo. The sandbox refused the publish step, so
-  the repo has to be created by hand; everything else is ready and the
-  release artifacts are built in dist/.
+- Making the repo public. It is published and complete at
+  LostMachinist-Dev/VoiceNotepad with the v2.0.0 release and all four
+  assets, but still private: the sandbox will not create public surface,
+  so the visibility switch has to be flipped by hand in Settings.
+- Note for next time: a fine-grained GitHub token cannot create a
+  user-owned repo at all (GitHub limitation, not a permission setting).
+  It can create one inside an organisation, which is why this lives in
+  LostMachinist-Dev rather than under lostmachinist.
