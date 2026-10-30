@@ -53,6 +53,13 @@
 - The app detects a Wayland session and explains that the hotkeys cannot be
   delivered there, rather than failing silently.
 
+## Done in 2.0.1
+- Punctuation no longer opens the next bullet. The recogniser emits the full
+  stop or question mark a beat after the words, which is exactly when the
+  bullet hotkey gets pressed, so it landed at the start of the new bullet.
+  `document::insert_dictation` moves leading punctuation back to the line it
+  belongs to. Ten tests, built from the transcript Darrel reported.
+
 ## Done in this round
 - Fixed switching models mid-dictation. The microphone stayed open with no
   recogniser behind it, so the button stayed red, audio piled up unconsumed

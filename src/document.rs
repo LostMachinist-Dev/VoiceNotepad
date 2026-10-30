@@ -273,6 +273,95 @@ pub fn insert_at(text: &str, cursor: usize, insertion: &str) -> (String, usize) 
     (out, pos)
 }
 
+/// Punctuation a streaming recogniser emits a beat after the words it closes.
+const LATE_PUNCTUATION: [char; 8] = ['.', ',', '?', '!', ';', ':', '\u{2026}', '\u{2019}'];
+
+/// Insert dictated text, putting punctuation that arrived too late back on
+/// the line it belongs to.
+///
+/// The recogniser runs slightly behind the speaker, and the full stop or
+/// question mark closing a sentence comes a moment after the words. That
+/// moment is exactly when someone reaches for the new-bullet hotkey, having
+/// just finished the thought -- so the punctuation lands at the start of the
+/// fresh bullet instead of the end of what they said:
+///
+/// ```text
+/// Okay, are we working now
+/// • ? Oh yeah, that is what happens
+/// ```
+///
+/// When a dictated fragment arrives at the very start of a line or bullet and
+/// opens with punctuation, that punctuation goes to the end of the previous
+/// line and only the rest is inserted at the cursor. Typing is unaffected;
+/// this is only on the dictation path.
+pub fn insert_dictation(text: &str, cursor: usize, insertion: &str) -> (String, usize) {
+    let cursor_byte = char_to_byte(text, cursor);
+
+    let Some((punctuation, rest)) = split_late_punctuation(insertion) else {
+        return insert_at(text, cursor, insertion);
+    };
+    if !at_line_content_start(text, cursor_byte) {
+        return insert_at(text, cursor, insertion);
+    }
+    let Some(previous_end) = previous_content_line_end(text, cursor_byte) else {
+        return insert_at(text, cursor, insertion);
+    };
+
+    let mut out = String::with_capacity(text.len() + insertion.len());
+    out.push_str(&text[..previous_end]);
+    out.push_str(&punctuation);
+    out.push_str(&text[previous_end..cursor_byte]);
+    out.push_str(&rest);
+    let new_byte = out.len();
+    out.push_str(&text[cursor_byte..]);
+    let pos = byte_to_char(&out, new_byte);
+    (out, pos)
+}
+
+/// Split a leading run of punctuation off a fragment, with the rest trimmed.
+///
+/// `None` when the fragment does not start with punctuation, which is the
+/// overwhelmingly common case.
+fn split_late_punctuation(insertion: &str) -> Option<(String, String)> {
+    let mut end = 0;
+    for (i, c) in insertion.char_indices() {
+        if LATE_PUNCTUATION.contains(&c) {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((insertion[..end].to_string(), insertion[end..].trim_start().to_string()))
+}
+
+/// Is the cursor before any of its line's content -- at the start of the
+/// line, or just after a bullet's indent and marker?
+fn at_line_content_start(text: &str, cursor_byte: usize) -> bool {
+    let line_start = text[..cursor_byte].rfind('\n').map_or(0, |i| i + 1);
+    parse_line(&text[line_start..cursor_byte]).text.is_empty()
+}
+
+/// The byte offset just past the last non-space character of the nearest
+/// earlier line that has any content.
+///
+/// Blank lines and empty bullets are skipped: the punctuation belongs to the
+/// words that were actually spoken, however many empty lines are in between.
+fn previous_content_line_end(text: &str, cursor_byte: usize) -> Option<usize> {
+    let line_start = text[..cursor_byte].rfind('\n').map_or(0, |i| i + 1);
+    let mut end = line_start.checked_sub(1)?;
+    loop {
+        let start = text[..end].rfind('\n').map_or(0, |i| i + 1);
+        let line = &text[start..end];
+        if !parse_line(line).text.trim().is_empty() {
+            return Some(start + line.trim_end().len());
+        }
+        end = start.checked_sub(1)?;
+    }
+}
+
 /// Replace the characters in `range` with `replacement`.
 ///
 /// This is how a streaming transcription updates its in-progress phrase in
@@ -339,6 +428,118 @@ pub fn normalize_newlines(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- punctuation that arrives after the bullet hotkey ------------------
+
+    #[test]
+    fn a_late_question_mark_goes_back_to_the_sentence_it_closes() {
+        // Reported from real dictation: the recogniser emits "?" a moment
+        // after the words, by which time the new bullet already exists, so
+        // it used to open the bullet instead of closing the sentence.
+        let text = "Okay, are we working now\n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, pos) = insert_dictation(text, cursor, "? Oh yeah");
+
+        assert_eq!(out, "Okay, are we working now?\n\u{2022} Oh yeah");
+        assert_eq!(out.chars().count(), pos);
+    }
+
+    #[test]
+    fn a_late_full_stop_does_the_same() {
+        let text = "that is what happens\n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, ". That is really strange");
+        assert_eq!(out, "that is what happens.\n\u{2022} That is really strange");
+    }
+
+    #[test]
+    fn punctuation_alone_still_finds_its_line() {
+        let text = "a complete thought\n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, ".");
+        assert_eq!(out, "a complete thought.\n\u{2022} ");
+    }
+
+    #[test]
+    fn it_reaches_past_blank_lines_and_empty_bullets() {
+        let text = "the words that were spoken\n\n\u{2022} \n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, "! Next");
+        assert_eq!(out, "the words that were spoken!\n\n\u{2022} \n\u{2022} Next");
+    }
+
+    #[test]
+    fn it_works_at_a_nested_bullet_too() {
+        let text = "a point worth making\n    \u{25E6} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, "? And another");
+        assert_eq!(out, "a point worth making?\n    \u{25E6} And another");
+    }
+
+    #[test]
+    fn mid_line_punctuation_is_left_exactly_where_it_lands() {
+        // The cursor is past the bullet's content, so nothing moves. This is
+        // every fragment after the first, and must not be disturbed.
+        let text = "first line\n\u{2022} already talking";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, ", and more");
+        assert_eq!(out, "first line\n\u{2022} already talking, and more");
+    }
+
+    #[test]
+    fn a_fragment_that_does_not_start_with_punctuation_is_untouched() {
+        let text = "first line\n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, "and the punctuation in general");
+        assert_eq!(out, "first line\n\u{2022} and the punctuation in general");
+    }
+
+    #[test]
+    fn with_nothing_before_it_the_punctuation_stays_put() {
+        // No earlier line to carry it, so moving it would lose it.
+        let text = "\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, "? Opening question");
+        assert_eq!(out, "\u{2022} ? Opening question");
+    }
+
+    #[test]
+    fn trailing_spaces_on_the_previous_line_do_not_strand_the_punctuation() {
+        let text = "a thought   \n\u{2022} ";
+        let cursor = text.chars().count();
+        let (out, _) = insert_dictation(text, cursor, "? Next");
+        assert!(out.starts_with("a thought?"), "got {out:?}");
+    }
+
+    #[test]
+    fn the_whole_reported_transcript_comes_out_right() {
+        // Replaying Darrel's note: speak, hit the bullet key, and the
+        // punctuation arrives in the next fragment each time.
+        let bursts = [
+            ("Okay, are we working now", true),
+            ("? Oh yeah, that's what happens when you get two instance going", true),
+            ("? That's really strange about the question marks", false),
+        ];
+        let mut text = String::new();
+        let mut cursor = 0usize;
+        for (fragment, then_bullet) in bursts {
+            let (next, pos) = insert_dictation(&text, cursor, fragment);
+            text = next;
+            cursor = pos;
+            if then_bullet {
+                let (next, pos) = insert_new_bullet(&text, cursor);
+                text = next;
+                cursor = pos;
+            }
+        }
+        for line in text.lines() {
+            assert!(
+                !parse_line(line).text.starts_with(['?', '.', ',', '!']),
+                "a line still opens with punctuation:\n{text}"
+            );
+        }
+        assert!(text.starts_with("Okay, are we working now?"), "got {text:?}");
+    }
 
     const B1: &str = "\u{2022}"; // level 1 marker
     const B2: &str = "\u{25E6}"; // level 2 marker

@@ -1,6 +1,6 @@
 [package]
 name = "voice-notepad"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 rust-version = "1.82"
 description = "A Notepad look-alike with local, offline streaming speech-to-text"

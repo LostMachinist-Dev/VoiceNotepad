@@ -15,7 +15,7 @@ and everything after that is offline.
 
 ## Installing on Windows
 
-Download `VoiceNotepad-2.0.0-Setup.exe` from the
+Download `VoiceNotepad-2.0.1-Setup.exe` from the
 [latest release](https://github.com/LostMachinist-Dev/VoiceNotepad/releases/latest)
 and run it. Windows will warn you about it first - it is not code-signed yet,
 so click **More info** and then **Run anyway**. (More on that
@@ -30,7 +30,7 @@ progress bar. The recommended model is 2.4 GB, so give it a few minutes; you
 can type while it downloads, and there is a much smaller one in Settings if
 you would rather. After that it never uses the network again.
 
-There is also `VoiceNotepad-2.0.0-portable.zip` if you would rather not
+There is also `VoiceNotepad-2.0.1-portable.zip` if you would rather not
 install anything: unzip it and run the exe. Keep `onnxruntime.dll` in the same
 folder - the program will not start without it.
 
@@ -180,7 +180,7 @@ rediscovering.
 
 ## Sharing it with other people
 
-Send them `VoiceNotepad-2.0.0-Setup.exe` and nothing else. It is a single
+Send them `VoiceNotepad-2.0.1-Setup.exe` and nothing else. It is a single
 file - the support DLL is packed inside it and only appears on their disk when
 they install.
 

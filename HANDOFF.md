@@ -99,6 +99,27 @@ own spacing, dropping a leading space only at the start of a line or straight
 after a bullet marker, where it would read as an indent. If dictation ever
 starts breaking words apart again, that function is where to look.
 
+## Punctuation arrives after the words, and that matters
+
+A streaming recogniser emits the full stop or question mark closing a
+sentence a moment after the words themselves. That moment is exactly when
+someone reaches for the new-bullet hotkey, having just finished the thought,
+so the punctuation used to arrive after the bullet already existed and open
+it instead:
+
+```text
+Okay, are we working now
+• ? Oh yeah, that's what happens
+```
+
+`document::insert_dictation` handles it: a dictated fragment arriving at the
+start of a line or bullet and opening with punctuation has that punctuation
+moved to the end of the nearest earlier line with content. It reaches past
+blank lines and empty bullets, and leaves the punctuation alone when there is
+no earlier line to carry it. It is on the dictation path only, so typing is
+unaffected -- anything else that inserts recognised text must go through it
+rather than `insert_at`.
+
 ## Decisions worth knowing about
 
 **CPU, not GPU.** A CUDA or DirectML build cross-compiled from Linux would
@@ -166,7 +187,7 @@ makensis once into `~/.local/share/voicenotepad-build` and runs it under Wine.
 ### The commands
 
 ```sh
-./scripts/build-installer.sh     # everything -> dist/VoiceNotepad-2.0.0-Setup.exe
+./scripts/build-installer.sh     # everything -> dist/VoiceNotepad-2.0.1-Setup.exe
 ./scripts/build-windows.sh       # just the Windows exe
 ./scripts/build-windows.sh debug # ... unoptimised, with a console window
 

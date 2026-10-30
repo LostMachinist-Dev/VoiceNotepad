@@ -561,7 +561,7 @@ impl VoiceNotepad {
         }
         self.last_dictation = Some(now);
 
-        let (text, cursor) = document::insert_at(&self.text, self.cursor, &insertion);
+        let (text, cursor) = document::insert_dictation(&self.text, self.cursor, &insertion);
         self.text = text;
         self.set_cursor(cursor);
         self.dirty = true;
