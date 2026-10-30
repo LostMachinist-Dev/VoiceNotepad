@@ -16,7 +16,7 @@ and everything after that is offline.
 ## Installing on Windows
 
 Download `VoiceNotepad-2.0.0-Setup.exe` from the
-[latest release](https://github.com/lostmachinist/VoiceNotepad/releases/latest)
+[latest release](https://github.com/LostMachinist-Dev/VoiceNotepad/releases/latest)
 and run it. Windows will warn you about it first - it is not code-signed yet,
 so click **More info** and then **Run anyway**. (More on that
 [below](#sharing-it-with-other-people).)
@@ -40,7 +40,7 @@ There is no Linux package yet; build it from source. It takes one command
 once the prerequisites under [Building it](#building-it) are in place:
 
 ```sh
-git clone https://github.com/lostmachinist/VoiceNotepad.git
+git clone https://github.com/LostMachinist-Dev/VoiceNotepad.git
 cd VoiceNotepad
 ./scripts/install-linux.sh      # everything goes under ~/.local, no root needed
 ./scripts/uninstall-linux.sh    # puts it back
@@ -196,7 +196,7 @@ the SHA256 checksums on each release let you verify you got what I built.
 
 ## Reporting bugs
 
-Open an issue: <https://github.com/lostmachinist/VoiceNotepad/issues>.
+Open an issue: <https://github.com/LostMachinist-Dev/VoiceNotepad/issues>.
 
 The single most useful thing you can include is **Help > About > Copy
 details**, which puts the version, the build target, your platform and the
