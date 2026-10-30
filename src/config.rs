@@ -223,7 +223,7 @@ fn default_toggle_hotkey() -> String {
 }
 
 fn default_bullet_hotkey() -> String {
-    "Ctrl+Alt+B".to_string()
+    "Ctrl+Backquote".to_string()
 }
 
 fn default_zoom() -> f32 {
@@ -394,7 +394,7 @@ mod tests {
     fn defaults_match_the_documented_hotkeys() {
         let c = Config::default();
         assert_eq!(c.toggle_hotkey, "Ctrl+Alt+Space");
-        assert_eq!(c.bullet_hotkey, "Ctrl+Alt+B");
+        assert_eq!(c.bullet_hotkey, "Ctrl+Backquote");
         assert_eq!(c.model, SpeechModel::Nemotron);
         assert_eq!(c.theme, ThemePref::System);
     }

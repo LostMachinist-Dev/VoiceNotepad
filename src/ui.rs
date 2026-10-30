@@ -1440,7 +1440,7 @@ impl VoiceNotepad {
                         // back except editing the settings file by hand.
                         if ui
                             .small_button("Reset to defaults")
-                            .on_hover_text("Ctrl+Alt+Space and Ctrl+Alt+B")
+                            .on_hover_text("Ctrl+Alt+Space and Ctrl+`")
                             .clicked()
                         {
                             let defaults = Config::default();

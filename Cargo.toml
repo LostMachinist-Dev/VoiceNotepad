@@ -4,8 +4,12 @@ version = "2.0.0"
 edition = "2021"
 rust-version = "1.82"
 description = "A Notepad look-alike with local, offline streaming speech-to-text"
-authors = ["yerko42@gmail.com"]
+authors = ["lostmachinist"]
 license = "MIT"
+repository = "https://github.com/lostmachinist/VoiceNotepad"
+readme = "README.md"
+keywords = ["speech-to-text", "dictation", "notepad", "parakeet", "offline"]
+categories = ["text-editors", "multimedia::audio"]
 
 [lib]
 name = "voice_notepad"
@@ -14,6 +18,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "VoiceNotepad"
 path = "src/main.rs"
+required-features = ["app"]
+
+# Uses the real recogniser, so it needs the same features the binary does.
+# Without this, `cargo test --no-default-features` fails trying to build it.
+[[example]]
+name = "transcribe-file"
+path = "examples/transcribe-file.rs"
 required-features = ["app"]
 
 [features]

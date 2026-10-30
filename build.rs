@@ -22,6 +22,7 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let object = out_dir.join("voice-notepad-resources.o");
+    let script = write_resource_script(&out_dir);
 
     // Two different resource compilers, because the two Windows toolchains
     // use different ones: windres for MinGW, llvm-rc (or rc.exe) for MSVC.
@@ -42,7 +43,7 @@ fn main() {
             .arg("assets")
             .arg("/FO")
             .arg(&res)
-            .arg("assets/voice-notepad.rc")
+            .arg(&script)
             .status();
         if matches!(&status, Ok(s) if s.success()) {
             println!("cargo:rustc-link-arg-bins={}", res.display());
@@ -50,7 +51,9 @@ fn main() {
         status
     } else {
         Command::new(&tool)
-            .args(["-I", "assets", "assets/voice-notepad.rc", "-o"])
+            .args(["-I", "assets"])
+            .arg(&script)
+            .arg("-o")
             .arg(&object)
             .status()
     };
@@ -70,4 +73,26 @@ fn main() {
             println!("cargo:warning=could not run {tool} ({err}); the exe will have no icon")
         }
     }
+}
+
+/// Fill the version into the resource template and write it next to the
+/// build output.
+///
+/// The icon is still referenced as a bare filename, so both resource
+/// compilers are given `assets` on their include path.
+fn write_resource_script(out_dir: &std::path::Path) -> PathBuf {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    // VERSIONINFO wants four comma-separated numbers; Cargo gives three.
+    let mut parts: Vec<String> = version.split('.').map(|p| p.to_string()).collect();
+    parts.resize(4, "0".to_string());
+
+    let template = std::fs::read_to_string("assets/voice-notepad.rc")
+        .expect("assets/voice-notepad.rc");
+    let filled = template
+        .replace("@COMMA_VERSION@", &parts.join(","))
+        .replace("@VERSION@", &version);
+
+    let path = out_dir.join("voice-notepad.rc");
+    std::fs::write(&path, filled).expect("write resource script");
+    path
 }

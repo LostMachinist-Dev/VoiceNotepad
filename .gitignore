@@ -1,4 +1,37 @@
+# Build output
 /target
-/third_party
-*.log
 /dist
+
+# Fetched build tools and third-party binaries (NSIS, ONNX Runtime, LLVM).
+# scripts/ re-fetches these on demand; they are far too big to commit.
+/third_party
+
+# Runtime logs and crash logs
+*.log
+
+# Speech models. Several hundred megabytes to 2.4 GB; the app downloads
+# them on first run.
+*.onnx
+*.onnx.data
+/models
+
+# Code-signing material must never land in the repo. scripts/sign-windows.sh
+# reads the certificate path and password from environment variables only.
+*.pfx
+*.p12
+*.pem
+*.key
+*.crt
+.env
+.env.*
+
+# Personal build notes: this generates Darrel's study guide and contains
+# local network addresses and paths that mean nothing to anyone else.
+/docs/build_study_guide.py
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

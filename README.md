@@ -11,11 +11,17 @@ reads as flowing prose rather than disconnected phrases.
 Nothing leaves the machine. The speech model is downloaded once on first run
 and everything after that is offline.
 
-![The window](assets/icon-preview.png)
+![Voice Notepad, with a dictated note and nested bullets](assets/screenshot.png)
 
 ## Installing on Windows
 
-Run `VoiceNotepad-2.0.0-Setup.exe` and click through it. It installs for your
+Download `VoiceNotepad-2.0.0-Setup.exe` from the
+[latest release](https://github.com/lostmachinist/VoiceNotepad/releases/latest)
+and run it. Windows will warn you about it first - it is not code-signed yet,
+so click **More info** and then **Run anyway**. (More on that
+[below](#sharing-it-with-other-people).)
+
+Then click through the installer. It installs for your
 user only, so Windows will not ask for an administrator password. When it
 finishes, Voice Notepad is in the Start menu.
 
@@ -30,7 +36,12 @@ folder - the program will not start without it.
 
 ## Installing on Linux
 
+There is no Linux package yet; build it from source. It takes one command
+once the prerequisites under [Building it](#building-it) are in place:
+
 ```sh
+git clone https://github.com/lostmachinist/VoiceNotepad.git
+cd VoiceNotepad
 ./scripts/install-linux.sh      # everything goes under ~/.local, no root needed
 ./scripts/uninstall-linux.sh    # puts it back
 ```
@@ -52,7 +63,7 @@ the mic button.
 | What | How |
 | --- | --- |
 | Start or stop listening | `Ctrl+Alt+Space`, or click the mic button |
-| New bullet | `Ctrl+Alt+B` |
+| New bullet | ``Ctrl+` `` |
 
 Both hotkeys work system-wide, so they still work while another program has
 focus. That is the point: you can be clicking around the app you are testing
@@ -67,12 +78,12 @@ and stops moving.
 
 ### Bullets
 
-Bullets only ever appear when you press `Ctrl+Alt+B`. A pause in speech never
+Bullets only ever appear when you press ``Ctrl+` ``. A pause in speech never
 creates one.
 
-- `Ctrl+Alt+B` starts a bullet at the cursor.
+- ``Ctrl+` `` starts a bullet at the cursor.
 - `Tab` on a bullet line pushes it one level deeper; `Shift+Tab` pulls it back.
-- `Ctrl+Alt+B` on a sub-bullet starts the next bullet at that same level.
+- ``Ctrl+` `` on a sub-bullet starts the next bullet at that same level.
 - `Enter` on an empty bullet removes the marker.
 - Levels cycle `•`, `◦`, `▪` as you nest, and nest as deep as you like.
 
@@ -120,12 +131,11 @@ that is the lever to pull.
 ### Settings
 
 Right-click the mic button, or `View > Settings`. You can change the theme,
-the speech model, the microphone, and both hotkeys. Settings are kept in
-`%APPDATA%\VoiceNotepad\config\config.json`.
+the speech model, the microphone, and both hotkeys. Changing the model
+downloads it if it is not already there.
 
-Models, smallest and fastest first: `tiny.en` (75 MB), `base.en` (142 MB),
-`small.en` (466 MB, the default), `medium.en` (1.5 GB). A bigger model is more
-accurate and needs more CPU. Changing it downloads the new one.
+Settings live in `%APPDATA%\VoiceNotepad\config\config.json` on Windows and
+`~/.config/voicenotepad/config.json` on Linux.
 
 ### The rest of the menus
 
@@ -138,14 +148,34 @@ the mic flips it.
 
 ## Building it
 
-The build runs on Linux and cross-compiles to Windows. See
-[HANDOFF.md](HANDOFF.md) for what has to be installed and why.
+Rust 1.82 or newer. On Linux you also need the ALSA headers, which cpal binds
+to for microphone capture:
 
 ```sh
-./scripts/build-installer.sh      # exe + installer, into dist/
-./scripts/build-windows.sh        # just the exe
-cargo test --no-default-features  # the logic tests, no audio hardware needed
+sudo apt install libasound2-dev     # Debian, Ubuntu, Mint
+sudo dnf install alsa-lib-devel     # Fedora
 ```
+
+Then:
+
+```sh
+cargo build --release               # a native build for the machine you are on
+cargo test                          # all of the tests
+cargo test --no-default-features    # just the logic, no audio or GPU needed
+```
+
+The Windows build is cross-compiled from Linux, which needs the mingw-w64
+toolchain (`sudo apt install mingw-w64`) and, for the installer, NSIS. The
+scripts fetch what else they need:
+
+```sh
+./scripts/build-windows.sh          # just the exe
+./scripts/build-installer.sh        # exe + installer, into dist/
+```
+
+[HANDOFF.md](HANDOFF.md) covers the architecture, why ONNX Runtime is linked
+one way on Linux and another on Windows, and the build problems worth not
+rediscovering.
 
 ## Sharing it with other people
 
@@ -155,10 +185,38 @@ they install.
 
 Expect Windows to warn about it. An unsigned program from an unknown publisher
 gets a blue "Windows protected your PC" screen; the way past it is **More
-info** then **Run anyway**, which is worth telling people in advance. The only
-real fix is a code-signing certificate - see HANDOFF.md, and
-`scripts/sign-windows.sh`, which signs the build once a certificate exists.
+info** then **Run anyway**, which is worth telling people in advance.
+
+The only real fix is a code-signing certificate, which costs money every year
+and buys nothing except the absence of that warning. `scripts/sign-windows.sh`
+is already written and wired into the build, so signing is one certificate
+away. **If enough people find this useful, I will pay for one.** Until then,
+the SHA256 checksums on each release let you verify you got what I built.
+
+## Reporting bugs
+
+Open an issue: <https://github.com/lostmachinist/VoiceNotepad/issues>.
+
+The single most useful thing you can include is **Help > About > Copy
+details**, which puts the version, the build target, your platform and the
+model and settings paths on the clipboard. Paste that into the issue along
+with what you did and what happened instead.
+
+If the app crashed, there is a log next to the settings file -
+`%APPDATA%\VoiceNotepad\config\voice-notepad.log` on Windows,
+`~/.config/voicenotepad/voice-notepad.log` on Linux. The last few lines are
+usually the interesting part.
+
+Things already known and not worth reporting are in
+[TASKS.md](TASKS.md) under *Next*; the big ones are that global hotkeys cannot
+work under Wayland, and that Find has no Replace or Find Previous yet.
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+The code is MIT. See [LICENSE](LICENSE).
+
+That covers this program only. The speech models are **not** part of it and
+are not redistributed here - the app downloads them from
+[altunenes/parakeet-rs](https://huggingface.co/altunenes/parakeet-rs) on
+Hugging Face on first run. They are NVIDIA Parakeet models and carry their own
+terms, which are on that page. Check them before you use this commercially.

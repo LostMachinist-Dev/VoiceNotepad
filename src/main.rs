@@ -36,7 +36,7 @@ fn main() -> eframe::Result<()> {
         println!("{}\n", diagnostics::version_line());
         println!("usage: VoiceNotepad [file]\n");
         println!("A Notepad look-alike with local speech to text.");
-        println!("Ctrl+Alt+Space starts and stops listening; Ctrl+Alt+B makes a bullet.");
+        println!("Ctrl+Alt+Space starts and stops listening; Ctrl+` makes a bullet.");
         println!("\noptions:");
         println!("  --check-mic     test the microphone and report what happened");
         println!("  -V, --version   print the version and exit");

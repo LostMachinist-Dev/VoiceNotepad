@@ -13,7 +13,7 @@
 //! fragments. A streaming model removes the need for any of it.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use parakeet_rs::{ExecutionConfig, Nemotron, ParakeetEOU, ParakeetEOUHandle};
@@ -227,6 +227,11 @@ struct Worker {
 
     last_audio: Instant,
     audio_warned: bool,
+
+    /// Models with a download thread already running. Switching back and
+    /// forth in Settings would otherwise start a second download of the same
+    /// model, and both would write the same `.part` files.
+    downloading: Arc<Mutex<Vec<SpeechModel>>>,
 }
 
 impl Worker {
@@ -248,6 +253,7 @@ impl Worker {
             pending: Vec::new(),
             last_audio: Instant::now(),
             audio_warned: false,
+            downloading: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -301,10 +307,30 @@ impl Worker {
             }
             Command::SetModel(model) => {
                 if model != self.model {
+                    // A different model means a different recogniser, and
+                    // only start_listening loads one -- which it skips
+                    // entirely while the mic is already open. Switching
+                    // mid-dictation therefore used to leave the microphone
+                    // running with no recogniser behind it: the button stayed
+                    // red, audio piled up in `pending` for as long as it was
+                    // left, and no text ever arrived. Stop and start again
+                    // around the swap, exactly as SetDevice does.
+                    let was_listening = self.capture.is_some();
+                    if was_listening {
+                        // Before the old recogniser is dropped, so the tail
+                        // of what was being said still comes out.
+                        self.stop_listening();
+                    }
                     self.model = model;
                     self.recogniser = None;
                     self.stale = true;
+                    self.pending.clear();
                     self.ensure_model_files();
+                    if was_listening {
+                        // If the new model still has to download, this says
+                        // so and turns the button off rather than pretending.
+                        self.start_listening();
+                    }
                 }
             }
             Command::Shutdown => {}
@@ -324,9 +350,17 @@ impl Worker {
             return;
         };
 
+        let wanted = self.model;
+        // Already fetching this one: let the running thread finish.
+        match self.downloading.lock() {
+            Ok(mut running) if !running.contains(&wanted) => running.push(wanted),
+            Ok(_) => return,
+            Err(_) => return,
+        }
+
         let events = self.events.clone();
         let ctx = self.ctx.clone();
-        let wanted = self.model;
+        let running = Arc::clone(&self.downloading);
         // Downloading on its own thread keeps the engine responsive, so the
         // mic button and Settings still work while gigabytes come down.
         std::thread::Builder::new()
@@ -338,6 +372,9 @@ impl Worker {
                     let _ = reporter.send(Event::ModelDownload(progress));
                     reporter_ctx.request_repaint();
                 });
+                if let Ok(mut running) = running.lock() {
+                    running.retain(|m| *m != wanted);
+                }
                 if let Err(message) = result {
                     let _ = events.send(Event::ModelDownload(model::Progress::Failed(
                         message.clone(),
@@ -474,7 +511,12 @@ impl Worker {
 
         let chunk_samples = match self.recogniser.as_ref() {
             Some(recogniser) => recogniser.chunk_samples(),
-            None => return,
+            // Nothing to feed the audio to. Holding on to it would grow this
+            // buffer for as long as the mic stayed open, so drop it.
+            None => {
+                self.pending.clear();
+                return;
+            }
         };
 
         let mut consumed = 0;
@@ -566,5 +608,86 @@ pub fn prepare_runtime() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// A worker with no microphone and no recogniser loaded, which is the
+    /// state a model switch leaves it in.
+    fn idle_worker() -> (Worker, Receiver<Event>) {
+        let (tx, rx) = channel();
+        let worker = Worker::new(SpeechModel::Nemotron, None, tx, egui::Context::default());
+        (worker, rx)
+    }
+
+    #[test]
+    fn audio_arriving_with_no_recogniser_is_not_hoarded() {
+        // Switching models while listening used to leave the microphone open
+        // with `recogniser: None`. Every pass through pump_audio appended to
+        // `pending` and then returned before consuming any of it, so the
+        // buffer grew for as long as the mic was left on -- about 3.8 MB a
+        // minute at 16 kHz, and never transcribed.
+        let (mut worker, _events) = idle_worker();
+        assert!(worker.recogniser.is_none());
+
+        for _ in 0..50 {
+            if let Ok(mut queue) = worker.audio_queue.lock() {
+                queue.extend(std::iter::repeat_n(0.01f32, 16_000));
+            }
+            worker.pump_audio();
+        }
+
+        assert!(
+            worker.pending.is_empty(),
+            "held {} samples with nothing to transcribe them",
+            worker.pending.len()
+        );
+    }
+
+    #[test]
+    fn switching_models_marks_the_recogniser_stale() {
+        let (mut worker, _events) = idle_worker();
+        worker.stale = false;
+
+        worker.handle(Command::SetModel(SpeechModel::Eou));
+
+        assert_eq!(worker.model, SpeechModel::Eou);
+        assert!(worker.stale, "the loaded recogniser no longer matches");
+        assert!(worker.recogniser.is_none());
+        assert!(worker.pending.is_empty());
+    }
+
+    #[test]
+    fn switching_to_the_model_already_in_use_changes_nothing() {
+        let (mut worker, _events) = idle_worker();
+        worker.stale = false;
+        worker.pending.push(0.5);
+
+        worker.handle(Command::SetModel(SpeechModel::Nemotron));
+
+        assert!(!worker.stale);
+        assert_eq!(worker.pending.len(), 1, "a no-op switch dropped audio");
+    }
+
+    #[test]
+    fn a_second_download_of_the_same_model_is_not_started() {
+        let (worker, _events) = idle_worker();
+        // Stand in for a download thread that is already running.
+        worker
+            .downloading
+            .lock()
+            .expect("lock")
+            .push(SpeechModel::Nemotron);
+
+        let before = Arc::strong_count(&worker.downloading);
+        let mut worker = worker;
+        worker.ensure_model_files();
+
+        // Nothing was spawned, so nothing took a second reference.
+        assert_eq!(Arc::strong_count(&worker.downloading), before);
     }
 }

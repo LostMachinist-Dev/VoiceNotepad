@@ -1,4 +1,9 @@
-/* No #include: every value below is a numeric literal, and pulling in
+/* Template. build.rs substitutes @COMMA_VERSION@ and @VERSION@ from
+   Cargo.toml and compiles the result, so the version shown in Explorer's
+   file properties cannot drift away from the crate version. Edit the
+   version in Cargo.toml, not here.
+
+   No #include: every value below is a numeric literal, and pulling in
    winver.h would need the Windows SDK headers on the include path, which
    llvm-rc does not have when cross-compiling. */
 
@@ -6,8 +11,8 @@
 1 ICON "voice-notepad.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,2,0,0
-PRODUCTVERSION  1,2,0,0
+FILEVERSION     @COMMA_VERSION@
+PRODUCTVERSION  @COMMA_VERSION@
 FILEOS          0x40004L   /* VOS_NT_WINDOWS32 */
 FILETYPE        0x1L       /* VFT_APP */
 BEGIN
@@ -17,11 +22,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Voice Notepad"
             VALUE "FileDescription",  "Voice Notepad - Notepad with local speech to text"
-            VALUE "FileVersion",      "1.2.0"
+            VALUE "FileVersion",      "@VERSION@"
             VALUE "InternalName",     "VoiceNotepad"
             VALUE "OriginalFilename", "VoiceNotepad.exe"
             VALUE "ProductName",      "Voice Notepad"
-            VALUE "ProductVersion",   "1.2.0"
+            VALUE "ProductVersion",   "@VERSION@"
         END
     END
     BLOCK "VarFileInfo"

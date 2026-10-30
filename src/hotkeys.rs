@@ -271,9 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn the_two_default_hotkeys_are_different_registrations() {
-        let toggle = to_hotkey(&HotkeySpec::parse("Ctrl+Alt+Space").unwrap()).unwrap();
-        let bullet = to_hotkey(&HotkeySpec::parse("Ctrl+Alt+B").unwrap()).unwrap();
+    fn the_shipped_default_hotkeys_can_both_be_registered() {
+        // Taken from Config rather than written out again, so changing a
+        // default to a key that cannot be registered fails here instead of
+        // silently shipping a hotkey that never fires.
+        let config = crate::config::Config::default();
+        let toggle = to_hotkey(&config.toggle_spec()).expect("default toggle registers");
+        let bullet = to_hotkey(&config.bullet_spec()).expect("default bullet registers");
         assert_ne!(toggle.id(), bullet.id());
     }
 }
