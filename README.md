@@ -171,6 +171,7 @@ scripts fetch what else they need:
 ```sh
 ./scripts/build-windows.sh          # just the exe
 ./scripts/build-installer.sh        # exe + installer, into dist/
+./scripts/package-release.sh        # all three release files + SHA256SUMS
 ```
 
 [HANDOFF.md](HANDOFF.md) covers the architecture, why ONNX Runtime is linked
